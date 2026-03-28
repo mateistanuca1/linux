@@ -41,3 +41,5 @@ obj-$(CONFIG_XEN_FRONT_PGDIR_SHBUF)	+= xen-front-pgdir-shbuf.o
 obj-$(CONFIG_XEN_UNPOPULATED_ALLOC)	+= unpopulated-alloc.o
 obj-$(CONFIG_XEN_GRANT_DMA_OPS)		+= grant-dma-ops.o
 obj-$(CONFIG_XEN_GRANT_DMA_IOMMU)	+= grant-dma-iommu.o
+obj-$(CONFIG_XEN_ARGO)			+= argo_ring.o
+CFLAGS_argo_ring.o                      += -I$(srctree)/arch/x86/xen
