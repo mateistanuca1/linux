@@ -34,8 +34,8 @@ static inline void argo_ring_check_sizes(void)
 /*
  * Ring management.
  */
-struct list_head argo_rings;
-rwlock_t argo_rings_lock;
+extern struct list_head argo_rings;
+extern rwlock_t argo_rings_lock;
 typedef int (*argo_recv_data_cb)(void *priv, void *data);
 struct argo_ring_hnd {
 	struct list_head l;

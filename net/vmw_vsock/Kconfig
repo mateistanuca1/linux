@@ -81,3 +81,15 @@ config HYPERV_VSOCKETS
 
 	  To compile this driver as a module, choose M here: the module will be
 	  called hv_sock. If unsure, say N.
+
+config XEN_ARGO_VSOCKETS
+	tristate "Xen Argo transport for Virtual Sockets"
+	depends on VSOCKETS && XEN_ARGO
+	help
+	  This module implements a Xen Argo transport for Virtual Sockets.
+
+	  Enable this transport if your Virtual Machine host supports Virtual
+	  Sockets over Xen Argo rings.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called vmw_vsock_argo_transport. If unsure, say N.
