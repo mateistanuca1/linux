@@ -1071,6 +1071,7 @@ EXPORT_SYMBOL_GPL(virtio_transport_dgram_allow);
 
 int virtio_transport_connect(struct vsock_sock *vsk)
 {
+	printk(KERN_DEBUG "virtio_transport_connect: vsk=%p\n", vsk);
 	struct virtio_vsock_pkt_info info = {
 		.op = VIRTIO_VSOCK_OP_REQUEST,
 		.vsk = vsk,

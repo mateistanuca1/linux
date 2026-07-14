@@ -31,6 +31,7 @@ config VSOCKETS_LOOPBACK
 	depends on VSOCKETS
 	default y
 	select VIRTIO_VSOCKETS_COMMON
+	default n if XEN_ARGO_VSOCKETS != n
 	help
 	  This module implements a loopback transport for Virtual Sockets,
 	  using vmw_vsock_virtio_transport_common.
@@ -85,6 +86,7 @@ config HYPERV_VSOCKETS
 config XEN_ARGO_VSOCKETS
 	tristate "Xen Argo transport for Virtual Sockets"
 	depends on VSOCKETS && XEN_ARGO
+	imply VSOCKETS_LOOPBACK if n
 	help
 	  This module implements a Xen Argo transport for Virtual Sockets.
 

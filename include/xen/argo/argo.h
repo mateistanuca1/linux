@@ -63,6 +63,7 @@ DEFINE_XEN_GUEST_HANDLE(uint8_t);
 #define ARGO_MSG_ACK   2
 #define ARGO_MSG_DATA  3
 #define ARGO_MSG_FIN   4
+#define ARGO_MSG_SYN_ACK 5
 
 
 typedef struct xen_argo_iov
@@ -282,9 +283,6 @@ struct xen_argo_ring_message_header
  */
 #define XEN_ARGO_OP_notify              4
 
-#define XEN_ARGO_SEND_SYN               1
-
-#define XEN_ARGO_SEND_ACK               2
 
 
 

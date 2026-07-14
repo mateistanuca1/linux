@@ -579,7 +579,7 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 		break;
 	case SOCK_STREAM:
 	case SOCK_SEQPACKET:
-		if (vsock_use_local_transport(remote_cid))
+		if (!(remote_flags & VMADDR_FLAG_NO_LOCAL) && vsock_use_local_transport(remote_cid))
 			new_transport = transport_local;
 		else if (remote_cid <= VMADDR_CID_HOST || !transport_h2g ||
 			 (remote_flags & VMADDR_FLAG_TO_HOST))
@@ -783,7 +783,6 @@ static int __vsock_bind_connectible(struct vsock_sock *vsk,
 {
 	struct net *net = sock_net(sk_vsock(vsk));
 	struct sockaddr_vm new_addr;
-
 	if (!net->vsock.port)
 		net->vsock.port = get_random_u32_above(LAST_RESERVED_PORT);
 
@@ -1707,11 +1706,14 @@ static int vsock_connect(struct socket *sock, struct sockaddr_unsized *addr,
 			goto out;
 		}
 
+
 		err = vsock_auto_bind(vsk);
 		if (err)
 			goto out;
 
+		
 		sk->sk_state = TCP_SYN_SENT;
+
 
 		err = transport->connect(vsk);
 		if (err < 0)
@@ -1912,6 +1914,7 @@ out:
 
 static int vsock_listen(struct socket *sock, int backlog)
 {
+
 	int err;
 	struct sock *sk;
 	struct vsock_sock *vsk;
@@ -1939,6 +1942,25 @@ static int vsock_listen(struct socket *sock, int backlog)
 
 	sk->sk_max_ack_backlog = backlog;
 	sk->sk_state = TCP_LISTEN;
+
+
+	if (!vsk->transport) {
+		err = vsock_assign_transport(vsk, NULL);
+		if (err) {
+			sk->sk_state = TCP_CLOSE;
+			goto out;
+		}
+	}
+
+
+	if (vsk->transport->listen) {
+        	err = vsk->transport->listen(vsk);
+       	 	if (err) {
+            		sk->sk_state = TCP_CLOSE; // Dacă Argo a eșuat, anulăm ascultarea
+            		goto out;
+        	}
+    	}
+	
 
 	err = 0;
 
