@@ -1122,6 +1122,7 @@ static int vsock_getname(struct socket *sock,
 	err = 0;
 
 	lock_sock(sk);
+	printk("vsock_getname: sock->state=%d, peer=%d\n", sock->state, peer);
 
 	if (peer) {
 		if (sock->state != SS_CONNECTED) {

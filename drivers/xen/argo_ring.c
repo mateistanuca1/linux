@@ -24,6 +24,8 @@
 struct list_head argo_rings;
 rwlock_t argo_rings_lock;
 
+static void argo_recv_work_fn(struct work_struct *work);
+
 /*
  * Ring management helpers.
  */
@@ -78,11 +80,16 @@ argo_gfn_array_alloc(volatile void *ring_ptr, size_t n)
 	return ga;
 }
 
+
+
+
 /*
  * Ring interface.
  */
 void argo_ring_handle_free(struct argo_ring_hnd *h)
 {
+	cancel_work_sync(&h->recv_work);
+	skb_queue_purge(&h->pending_skbs);
 	list_del(&h->l);
 
 	argo_gfn_array_free(h->gfns);
@@ -124,6 +131,8 @@ argo_ring_handle_alloc(domid_t domain, unsigned int port,
 	spin_lock_init(&h->ring_lock);
 	write_lock(&argo_rings_lock);
 	list_add_tail(&h->l, &argo_rings);
+	skb_queue_head_init(&h->pending_skbs);
+	INIT_WORK(&h->recv_work, argo_recv_work_fn);
 	write_unlock(&argo_rings_lock);
 
 	h->partner_id = domain;
@@ -252,8 +261,10 @@ int argo_ring_recv(struct argo_ring_hnd *h, void *buf, size_t len)
 	size_t chunk;
 	size_t rx = r->rx_ptr;
 
-	if (len > argo_ring_has_data(h))
+	if (len > argo_ring_has_data(h)) {
+		pr_err("Requested %zuB, but only %zuB available.\n", len, argo_ring_has_data(h));
 		return -E2BIG;
+	}
 
 	pr_debug("receive %zuB: ring_len:%uB data:%zuB data-no-wrap:%zuB "
 		"space-left:%zuB, rx:%zu, tx:%u.\n",
@@ -278,56 +289,62 @@ int argo_ring_recv(struct argo_ring_hnd *h, void *buf, size_t len)
 }
 EXPORT_SYMBOL_GPL(argo_ring_recv);
 
-#if 0
 
-static struct sk_buff *argo_ring_recv_skb(struct argo_ring_hnd *h)
-{
-	const struct xen_argo_ring_message_header *mh;
-	struct sk_buff *skb;
-	size_t msg_len;
-	int rc = 0;
 
-	/* There is at least a header. */
-	skb = alloc_skb(sizeof (*mh), GFP_ATOMIC);
-	if (!skb)
-		return ERR_PTR(-ENOMEM);
+static struct sk_buff* argo_ring_recv_skb(struct argo_ring_hnd* h) {
+    const struct xen_argo_ring_message_header* mh;
+    struct sk_buff* skb;
+    size_t msg_len;
+    int rc = 0;
 
-	/* FIXME: ring_lock.
-	 * Tasklet can only be ran on one CPU (while it may be scheduled by
-	 * more than one). This lock is useless, right?
-	 */
-	spin_lock(&h->ring_lock);
-	argo_ring_recv(h, skb_put(skb, sizeof (*mh)), sizeof (*mh));
+    skb = alloc_skb(sizeof(*mh), GFP_KERNEL);
+    if (!skb) {
+        pr_err("Failed to allocate skb to receive message header with size %zu.\n", sizeof(*mh));
+        return ERR_PTR(-ENOMEM);
+    }
 
-	mh = (void*)skb->data;
-	msg_len = mh->len - sizeof (*mh);
+    spin_lock(&h->ring_lock);
+    argo_ring_recv(h, skb_put(skb, sizeof(*mh)), sizeof(*mh));
+    mh = (void*)skb->data;
+    msg_len = mh->len - sizeof(*mh);
 
-	if (unlikely(msg_len > argo_ring_has_data(h))) {
-		pr_debug("Invalid packet, message size exceeds ring capacity.");
-		rc = E2BIG;
-		goto out;
-	}
+    if (unlikely(msg_len > argo_ring_has_data(h))) {
+        pr_err("Invalid packet, message size exceeds ring capacity.");
+        rc = E2BIG;
+        goto out;   /* ring deja inconsistent, nu putem drena în siguranță */
+    }
 
-	if (msg_len) {
-		/* Data in this packet. */
-		if (pskb_expand_head(skb, 0, msg_len, GFP_ATOMIC)) {
-			pr_debug("Failed to allocate skb to receive message.");
-			rc = ENOMEM;
-			goto out;
-		}
-		argo_ring_recv(h, skb_put(skb, msg_len), msg_len);
-	}
-	/* FIXME: See ring_lock above. */
-	spin_unlock(&h->ring_lock);
+    if (msg_len) {
+        if (pskb_expand_head(skb, 0, msg_len, GFP_KERNEL)) {
+            pr_err("Failed to allocate skb to receive message.");
+            rc = ENOMEM;
+            goto drain;   /* <-- AICI e schimbarea cheie */
+        }
+        argo_ring_recv(h, skb_put(skb, msg_len), msg_len);
+        
+    }
 
-	return skb;
+    spin_unlock(&h->ring_lock);
+    return skb;
 
+drain:
+    /* msg_len a fost deja validat mai sus (< has_data), deci e sigur să
+     * consumăm exact atâția bytes din ring, ca rx_ptr să rămână corect. */
+    {
+        char scratch[128];
+        size_t remaining = msg_len;
+        while (remaining) {
+            size_t chunk = min(remaining, sizeof(scratch));
+            argo_ring_recv(h, scratch, chunk);
+            remaining -= chunk;
+        }
+    }
 out:
-	spin_unlock(&h->ring_lock);
-	kfree_skb(skb);
-	return ERR_PTR(-rc);
+    spin_unlock(&h->ring_lock);
+    kfree_skb(skb);
+    return ERR_PTR(-rc);
 }
-#endif
+
 
 
 int argo_ring_send(struct argo_ring_hnd *h, xen_argo_iov_t *iov,
@@ -384,6 +401,26 @@ EXPORT_SYMBOL_GPL(argo_get_local_cid);
 /*
  * Tasklet handling packets reception.
  */
+
+static void argo_recv_work_fn(struct work_struct *work)
+{
+    struct argo_ring_hnd *h = container_of(work, struct argo_ring_hnd, recv_work);
+    struct sk_buff *skb;
+    int rc;
+
+    while (argo_ring_has_data(h) >= sizeof(struct xen_argo_ring_message_header)) {
+        skb = argo_ring_recv_skb(h);
+        if (IS_ERR(skb)) {
+            pr_warn("Failed to retrieve packet from Argo ring (%ld).\n", -PTR_ERR(skb));
+            break;
+        }
+        rc = h->recv_cb(h->priv, skb);
+        if (rc) {
+            pr_warn("Failed to queue received packet, dropping.\n");
+            kfree_skb(skb);
+        }
+    }
+}
 #if 0
 static void argo_handle_event(struct tasklet_struct *t)
 {

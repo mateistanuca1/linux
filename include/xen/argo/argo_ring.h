@@ -18,7 +18,7 @@ struct argo_gfn_array {
  * Arbitrary fixed ring size for now.
  * This size is chosen to match other Argo driver implementations.
  */
-static const size_t ring_len = 32 * PAGE_SIZE;
+static const size_t ring_len = 128 * PAGE_SIZE;
 
 /*
  * Messages on the ring are aligned on XEN_ARGO_MSG_SLOT_SIZE.
@@ -48,6 +48,8 @@ struct argo_ring_hnd {
 	argo_recv_data_cb recv_cb;
 	void *priv;	/* TODO: Do better. Opaque to get struct
 			   vsock_sock/struct sock to recv_cb */
+	struct sk_buff_head pending_skbs;   /* packets waiting for process-context delivery */
+	struct work_struct recv_work;
 };
 
 /*

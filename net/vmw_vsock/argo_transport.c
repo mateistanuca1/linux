@@ -30,13 +30,18 @@ struct argo_transport {
     struct list_head sockets; /* List of all argo_transport. */
     struct argo_ring_hnd* h;  /* Argo ring handle. */
     struct vsock_sock* vsk;   /* Parent vsock struct. */
-    bool is_ring_owner;          /* True if this transport owns the ring handle. */
+    bool is_ring_owner;       /* True if this transport owns the ring handle. */
+    size_t sent_bytes;
+    size_t recv_bytes;
 };
 
 /*
  * Global socket list.
  */
 struct list_head sockets = LIST_HEAD_INIT(sockets);
+
+static struct workqueue_struct *argo_recv_wq;
+
 
 /*
  * Private data helpers.
@@ -56,6 +61,8 @@ static int argo_transport_socket_init(struct vsock_sock* vsk,
     list_add_tail(&argo_trans(vsk)->sockets, &sockets);
     argo_trans(vsk)->vsk = vsk;
     argo_trans(vsk)->h = NULL;
+    argo_trans(vsk)->sent_bytes = 0;
+    argo_trans(vsk)->recv_bytes = 0;
 
     return 0;
 }
@@ -65,7 +72,6 @@ static void argo_transport_destruct(struct vsock_sock* vsk) {
     list_del_init(&argo_trans(vsk)->sockets);
     kfree(argo_trans(vsk));
     vsk->trans = NULL;
-
     return;
 }
 
@@ -125,51 +131,7 @@ static inline bool sockaddr_vm_match(const struct sockaddr_vm* src,
     return ((src->svm_cid == dst->svm_cid) && (src->svm_port == dst->svm_port));
 }
 
-static struct sk_buff* argo_ring_recv_skb(struct argo_ring_hnd* h) {
-    const struct xen_argo_ring_message_header* mh;
-    struct sk_buff* skb;
-    size_t msg_len;
-    int rc = 0;
 
-    /* There is at least a header. */
-    skb = alloc_skb(sizeof(*mh), GFP_ATOMIC);
-    if (!skb) return ERR_PTR(-ENOMEM);
-
-    /* FIXME: ring_lock.
-     * Tasklet can only be ran on one CPU (while it may be scheduled by
-     * more than one). This lock is useless, right?
-     */
-    spin_lock(&h->ring_lock);
-    argo_ring_recv(h, skb_put(skb, sizeof(*mh)), sizeof(*mh));
-
-    mh = (void*)skb->data;
-    msg_len = mh->len - sizeof(*mh);
-
-    if (unlikely(msg_len > argo_ring_has_data(h))) {
-        pr_debug("Invalid packet, message size exceeds ring capacity.");
-        rc = E2BIG;
-        goto out;
-    }
-
-    if (msg_len) {
-        /* Data in this packet. */
-        if (pskb_expand_head(skb, 0, msg_len, GFP_ATOMIC)) {
-            pr_debug("Failed to allocate skb to receive message.");
-            rc = ENOMEM;
-            goto out;
-        }
-        argo_ring_recv(h, skb_put(skb, msg_len), msg_len);
-    }
-    /* FIXME: See ring_lock above. */
-    spin_unlock(&h->ring_lock);
-
-    return skb;
-
-out:
-    spin_unlock(&h->ring_lock);
-    kfree_skb(skb);
-    return ERR_PTR(-rc);
-}
 
 static int argo_ring_send_skb(struct argo_ring_hnd* h,
                               const struct sk_buff* skb,
@@ -247,7 +209,10 @@ static int argo_transport_stream_connect_recv_cb(void* priv, void* data) {
         lock_sock(sk);
 
         if (sk_acceptq_is_full(sk)) {
-            printk(KERN_WARNING "Accept queue full for dom%u:%u, dropping SYN.\n", 
+            printk(KERN_INFO "acceptq backlog=%d max=%d\n", sk->sk_ack_backlog,
+                   sk->sk_max_ack_backlog);
+            printk(KERN_WARNING
+                   "Accept queue full for dom%u:%u, dropping SYN.\n",
                    hdr->source.domain_id, hdr->source.aport);
             release_sock(sk);
             return -ENOMEM;
@@ -287,6 +252,7 @@ static int argo_transport_stream_connect_recv_cb(void* priv, void* data) {
         vsock_insert_connected(child_vsk);
 
         vsock_enqueue_accept(sk, child);
+        sk_acceptq_added(sk);
         sk->sk_data_ready(sk);
         release_sock(sk);
 
@@ -328,7 +294,8 @@ static int argo_transport_stream_connect_recv_cb(void* priv, void* data) {
     lock_sock(connected_sk);
 
     if (hdr->message_type == ARGO_MSG_FIN) {
-        printk(KERN_INFO "Received FIN from dom%u:%u \n", remote_addr.svm_cid, remote_addr.svm_port);
+        printk(KERN_INFO "Received FIN from dom%u:%u \n", remote_addr.svm_cid,
+               remote_addr.svm_port);
         connected_sk->sk_state = TCP_CLOSE;
         connected_sk->sk_shutdown |= RCV_SHUTDOWN;
         connected_sk->sk_state_change(connected_sk);
@@ -338,6 +305,7 @@ static int argo_transport_stream_connect_recv_cb(void* priv, void* data) {
     }
 
     skb_pull(skb, sizeof(struct xen_argo_ring_message_header));
+    argo_trans(vsk)->recv_bytes += skb->len;
     skb_queue_tail(&connected_sk->sk_receive_queue, skb);
     connected_sk->sk_data_ready(connected_sk);
     release_sock(connected_sk);
@@ -361,6 +329,7 @@ static int argo_transport_stream_recv_cb(void* priv, void* data) {
                hdr->source.domain_id, hdr->source.aport);
         vsock_insert_connected(vsk);
         sk->sk_state = TCP_ESTABLISHED;
+        sk->sk_socket->state = SS_CONNECTED;
         sk->sk_state_change(sk);
         release_sock(sk);
         kfree_skb(skb);
@@ -532,7 +501,7 @@ static int argo_transport_dgram_enqueue(struct vsock_sock* vsk,
         return EINVAL;
     }
 
-    skb = alloc_skb(len, GFP_ATOMIC);
+    skb = alloc_skb(len, GFP_KERNEL);
     if (!skb) {
         pr_debug("%s: alloc_skb failed.\n", __func__);
         return -ENOMEM;
@@ -661,35 +630,68 @@ static ssize_t argo_transport_stream_dequeue(struct vsock_sock* vsk,
 
 static ssize_t argo_transport_stream_enqueue(struct vsock_sock* vsk,
                                              struct msghdr* msg, size_t len) {
+    struct sock *sk = &vsk->sk;
     int rc = 0;
     struct sk_buff* skb;
     xen_argo_send_addr_t sendaddr;
     size_t total_len = len + sizeof(struct xen_argo_ring_message_header);
+    long timeo;
+    int attempts = 0;
 
     if (sockaddrvm_to_argo(&vsk->local_addr, &sendaddr.src) ||
         sockaddrvm_to_argo(&vsk->remote_addr, &sendaddr.dst)) {
         return -EINVAL;
     }
-
-    skb = alloc_skb(total_len, GFP_ATOMIC);
+    skb = alloc_skb(total_len, GFP_KERNEL);
     if (!skb) {
         return -ENOMEM;
     }
-
     skb_reserve(skb, sizeof(struct xen_argo_ring_message_header));
-
     if (memcpy_from_msg(skb_put(skb, len), msg, len)) {
         kfree_skb(skb);
         return -EFAULT;
     }
+    printk(KERN_INFO "sk_sndtimeo=%ld MSG_DONTWAIT=%d\n", 
+       sk->sk_sndtimeo, !!(msg->msg_flags & MSG_DONTWAIT));
+    timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
 
-    rc = argo_ring_send_skb(argo_trans(vsk)->h, skb, &sendaddr, ARGO_MSG_DATA);
-    kfree_skb(skb);
-
-    if (rc < 0) {
-        return rc;
+    for (;;) {
+        attempts++;
+        rc = argo_ring_send_skb(argo_trans(vsk)->h, skb, &sendaddr, ARGO_MSG_DATA);
+        if (rc >= 0) {
+            argo_trans(vsk)->sent_bytes += len;
+            if (attempts > 1)
+                printk(KERN_INFO "enqueue: succeeded after %d attempts\n", attempts);
+            break;
+        }
+        if (rc != -EAGAIN && rc != -ENOBUFS) {
+            printk(KERN_INFO "enqueue: real error rc=%d, giving up\n", rc);
+            break;
+        }
+        if (!timeo) {
+            printk(KERN_INFO "enqueue: non-blocking, giving up after %d attempts\n", attempts);
+            rc = -EAGAIN;
+            break;
+        }
+        release_sock(sk);
+        msleep(1);
+        lock_sock(sk);
+        timeo -= msecs_to_jiffies(1);
+        if (sk->sk_err) {
+            printk(KERN_INFO "enqueue: sk_err=%d, giving up\n", sk->sk_err);
+            rc = -sk->sk_err;
+            break;
+        }
+        if (sk->sk_shutdown & SEND_SHUTDOWN) {
+            printk(KERN_INFO "enqueue: SEND_SHUTDOWN, giving up\n");
+            rc = -EPIPE;
+            break;
+        }
     }
 
+    kfree_skb(skb);
+    if (rc < 0)
+        return rc;
     return len;
 }
 
@@ -703,7 +705,10 @@ static s64 argo_transport_stream_has_data(struct vsock_sock* vsk) {
 }
 
 static s64 argo_transport_stream_has_space(struct vsock_sock* vsk) {
-    return 131072;
+    struct argo_transport *t = argo_trans(vsk);
+    if (!t->h)
+        return 0;
+    return argo_ring_has_space(t->h);
 }
 
 static u64 argo_transport_stream_rcvhiwat(struct vsock_sock* vsk) {
@@ -791,7 +796,14 @@ static int argo_transport_notify_send_post_enqueue(
  * Shutdown.
  */
 static int argo_transport_shutdown(struct vsock_sock* vsk, int mode) {
-    /* TODO: That might be where we want to send RST instead... */
+    struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+    xen_argo_send_addr_t addr;
+    if (skb) {
+        sockaddrvm_to_argo(&vsk->remote_addr, &addr.dst);
+        sockaddrvm_to_argo(&vsk->local_addr, &addr.src);
+        argo_ring_send_skb(argo_trans(vsk)->h, skb, &addr, ARGO_MSG_FIN);
+        kfree_skb(skb);
+    }
     return 0;
 }
 
@@ -883,41 +895,14 @@ static struct vsock_transport argo_transport = {
  * Tasklet handling packets reception.
  */
 
-static void argo_handle_event(struct tasklet_struct* t) {
+static irqreturn_t argo_interrupt(int irq, void* dev_id) {
     struct argo_ring_hnd *h, *tmp;
-    int rc;
-
     read_lock(&argo_rings_lock);
     list_for_each_entry_safe(h, tmp, &argo_rings, l) {
-        struct sk_buff* skb;
-
-        while (argo_ring_has_data(h) >=
-               sizeof(struct xen_argo_ring_message_header)) {
-            skb = argo_ring_recv_skb(h);
-            if (IS_ERR(skb)) {
-                pr_warn(
-                    "Failed to retrieve packet from Argo "
-                    "ring (%ld).\n",
-                    -PTR_ERR(skb));
-                break;
-            }
-            rc = h->recv_cb(h->priv, skb);
-            if (rc) {
-                pr_warn("Failed to queue received packet, dropping.\n");
-                kfree_skb(skb);
-                break;
-            }
-        }
+        if (argo_ring_has_data(h) >= sizeof(struct xen_argo_ring_message_header))
+            queue_work(argo_recv_wq, &h->recv_work);
     }
     read_unlock(&argo_rings_lock);
-}
-
-DECLARE_TASKLET(argo_event, argo_handle_event);
-/*
- * IRQ handler scheduling tasklet.
- */
-static irqreturn_t argo_interrupt(int irq, void* dev_id) {
-    tasklet_schedule(&argo_event);
     return IRQ_HANDLED;
 }
 
@@ -929,7 +914,6 @@ static int __init argo_transport_init(void) {
         pr_err("vsock_core_init() failed (%d).\n", rc);
     }
     rc = vsock_core_register(&argo_transport, VSOCK_TRANSPORT_F_G2H);
-    
 
     rc = argo_core_init(argo_interrupt);
     if (rc) {
@@ -938,6 +922,7 @@ static int __init argo_transport_init(void) {
         return rc;
     }
     pr_info("vsock_argo_transport registered.\n");
+    argo_recv_wq = alloc_workqueue("argo_recv", WQ_UNBOUND | WQ_HIGHPRI, 0);
 
     return 0;
 }
@@ -945,7 +930,7 @@ module_init(argo_transport_init);
 
 static void __exit argo_transport_exit(void) {
     /* TODO: Flush sockets... */
-
+    destroy_workqueue(argo_recv_wq);
     pr_info("vsock_argo_transport unregistered.\n");
     argo_core_cleanup();
     vsock_core_unregister(&argo_transport);
