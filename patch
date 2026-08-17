@@ -1,0 +1,89 @@
+From 70791bbe0e860ff65cf81d3b4beead357e8cd740 Mon Sep 17 00:00:00 2001
+From: Denis Mukhin <dmukhin@ford.com>
+Date: Sun, 9 Aug 2026 09:10:21 -0700
+Subject: [PATCH] argo: get rid of extra allocation in argo_ring_recv_skb()
+
+Signed-off-by: Denis Mukhin <dmukhin@ford.com>
+---
+drivers/xen/argo_ring.c | 45 ++++++++++++++++++++---------------------
+1 file changed, 22 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/xen/argo_ring.c b/drivers/xen/argo_ring.c
+index 489cb795e56a..9e970c5a3c4c 100644
+--- a/drivers/xen/argo_ring.c
++++ b/drivers/xen/argo_ring.c
+@@ -292,39 +292,37 @@ EXPORT_SYMBOL_GPL(argo_ring_recv);
+
+
+static struct sk_buff* argo_ring_recv_skb(struct argo_ring_hnd* h) {
+-    const struct xen_argo_ring_message_header* mh;
+-    struct sk_buff* skb;
++    const struct xen_argo_ring_message_header mh;
++    struct sk_buff* skb = NULL;
+     size_t msg_len;
+     int rc = 0;
+
+-    skb = alloc_skb(sizeof(*mh), GFP_KERNEL);
+-    if (!skb) {
+-        pr_err("Failed to allocate skb to receive message header with size %zu.\n", sizeof(*mh));
+-        return ERR_PTR(-ENOMEM);
+-    }
+-
+     spin_lock(&h->ring_lock);
+-    argo_ring_recv(h, skb_put(skb, sizeof(*mh)), sizeof(*mh));
+-    mh = (void*)skb->data;
+-    msg_len = mh->len - sizeof(*mh);
+
++    argo_ring_recv(h, &mh, sizeof(mh));
++
++    msg_len = mh->len - sizeof(mh);
+     if (unlikely(msg_len > argo_ring_has_data(h))) {
+-        pr_err("Invalid packet, message size exceeds ring capacity.");
+-        rc = E2BIG;
++        pr_err("Invalid packet, message size exceeds ring capacity %zu/%zu.\n",
++                msg_len, argo_ring_has_data(h));
++        rc = -E2BIG;
+         goto out;   /* ring deja inconsistent, nu putem drena în siguranță */
+     }
+
+-    if (msg_len) {
+-        if (pskb_expand_head(skb, 0, msg_len, GFP_KERNEL)) {
+-            pr_err("Failed to allocate skb to receive message.");
+-            rc = ENOMEM;
+-            goto drain;   /* <-- AICI e schimbarea cheie */
+-        }
+-        argo_ring_recv(h, skb_put(skb, msg_len), msg_len);
+-        
++    skb = alloc_skb(mh->len, GFP_KERNEL);
++    if (!skb) {
++        pr_err("Failed to allocate skb to receive message header with size %zu.\n", sizeof(*mh));
++        rc = -ENOMEM;
++        goto out;
+     }
+
++    memcpy(skb_put(skb, sizeof(mh), &mh, sizeof(mh));
++
++    if (msg_len)
++        argo_ring_recv(h, skb_put(skb, msg_len), msg_len);
++
+     spin_unlock(&h->ring_lock);
++
+     return skb;
+
+drain:
+@@ -341,8 +339,9 @@ static struct sk_buff* argo_ring_recv_skb(struct argo_ring_hnd* h) {
+     }
+out:
+     spin_unlock(&h->ring_lock);
+-    kfree_skb(skb);
+-    return ERR_PTR(-rc);
++    if (skb)
++        kfree_skb(skb);
++    return ERR_PTR(rc);
+}
+
+
+-- 
+2.54.0
+
+ 

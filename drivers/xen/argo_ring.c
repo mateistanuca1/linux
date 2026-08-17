@@ -9,6 +9,9 @@
 #include <linux/slab.h>
 #include <linux/interrupt.h>
 #include <linux/irqreturn.h>
+#include <linux/mmzone.h>
+#include <linux/skbuff.h>
+#include <linux/workqueue.h>
 
 #include <xen/events.h>
 #include <xen/page.h>
@@ -23,6 +26,14 @@
  */
 struct list_head argo_rings;
 rwlock_t argo_rings_lock;
+
+/*
+ * Workqueue draining the rings into sk_buffs, in process context.
+ */
+static struct workqueue_struct *argo_recv_wq;
+
+/* Retry delay when the receive path is out of memory. */
+#define ARGO_RECV_RETRY_DELAY	msecs_to_jiffies(10)
 
 static void argo_recv_work_fn(struct work_struct *work);
 
@@ -88,9 +99,12 @@ argo_gfn_array_alloc(volatile void *ring_ptr, size_t n)
  */
 void argo_ring_handle_free(struct argo_ring_hnd *h)
 {
-	cancel_work_sync(&h->recv_work);
-	skb_queue_purge(&h->pending_skbs);
+	write_lock(&argo_rings_lock);
 	list_del(&h->l);
+	write_unlock(&argo_rings_lock);
+
+	cancel_delayed_work_sync(&h->recv_work);
+	skb_queue_purge(&h->pending_skbs);
 
 	argo_gfn_array_free(h->gfns);
 	argo_ring_free(h->ring);
@@ -129,17 +143,20 @@ argo_ring_handle_alloc(domid_t domain, unsigned int port,
 
 	/* FIXME: ring_lock. */
 	spin_lock_init(&h->ring_lock);
-	write_lock(&argo_rings_lock);
-	list_add_tail(&h->l, &argo_rings);
 	skb_queue_head_init(&h->pending_skbs);
-	INIT_WORK(&h->recv_work, argo_recv_work_fn);
-	write_unlock(&argo_rings_lock);
+	INIT_DELAYED_WORK(&h->recv_work, argo_recv_work_fn);
 
 	h->partner_id = domain;
 	h->aport = port;
 
 	h->recv_cb = recv_cb;
 	h->priv = priv;
+
+	/* Publish last: the interrupt handler walks this list and will kick
+	 * the worker as soon as the handle is visible. */
+	write_lock(&argo_rings_lock);
+	list_add_tail(&h->l, &argo_rings);
+	write_unlock(&argo_rings_lock);
 
 	pr_debug("New ring for partner dom%u:%u, %uB.\n",
 		h->partner_id, h->aport, h->ring_len);
@@ -254,95 +271,137 @@ inline size_t argo_ring_has_space(const struct argo_ring_hnd *h)
 }
 EXPORT_SYMBOL_GPL(argo_ring_has_space);
 
-int argo_ring_recv(struct argo_ring_hnd *h, void *buf, size_t len)
+/*
+ * Copy len bytes out of the ring, starting off bytes past rx_ptr, handling
+ * wrap-around. rx_ptr is left untouched: the caller decides whether the bytes
+ * are really consumed. Caller must hold ring_lock.
+ */
+static void argo_ring_copy_out(const struct argo_ring_hnd *h, void *buf,
+		size_t off, size_t len)
+{
+	const xen_argo_ring_t *r = h->ring;
+	unsigned char *p = buf;
+	const size_t rx = (READ_ONCE(r->rx_ptr) + off) % h->ring_len;
+	const size_t chunk = h->ring_len - rx;
+
+	if (len > chunk) {
+		memcpy(p, (void *)&r->ring[rx], chunk);
+		memcpy(&p[chunk], (void *)&r->ring[0], len - chunk);
+	} else
+		memcpy(p, (void *)&r->ring[rx], len);
+}
+
+/*
+ * Release len bytes back to the sender. Only call this once the payload is
+ * safely out of the ring: past this point Xen may overwrite it.
+ * Caller must hold ring_lock.
+ */
+static void argo_ring_consume(struct argo_ring_hnd *h, size_t len)
 {
 	xen_argo_ring_t *r = h->ring;
-	unsigned char *p = buf;
-	size_t chunk;
-	size_t rx = r->rx_ptr;
+	const size_t rx = ARGO_RING_ALIGN(READ_ONCE(r->rx_ptr) + len) %
+		h->ring_len;
 
+	mb();	/* rx cannot be set out-of-order, thank you. */
+	WRITE_ONCE(r->rx_ptr, rx);
+}
+
+int argo_ring_recv(struct argo_ring_hnd *h, void *buf, size_t len)
+{
 	if (len > argo_ring_has_data(h)) {
-		pr_err("Requested %zuB, but only %zuB available.\n", len, argo_ring_has_data(h));
+		pr_err("Requested %zuB, but only %zuB available.\n", len,
+			argo_ring_has_data(h));
 		return -E2BIG;
 	}
 
 	pr_debug("receive %zuB: ring_len:%uB data:%zuB data-no-wrap:%zuB "
-		"space-left:%zuB, rx:%zu, tx:%u.\n",
+		"space-left:%zuB, rx:%u, tx:%u.\n",
 		len, h->ring_len, argo_ring_has_data(h),
 		argo_ring_has_data_no_wrap(h),
 		argo_ring_has_space(h),
-		rx, r->tx_ptr);
+		h->ring->rx_ptr, h->ring->tx_ptr);
 
-	chunk = argo_ring_has_data_no_wrap(h);
-	if (len > chunk) {
-		memcpy(p, (void*)&r->ring[rx], chunk);
-		memcpy(&p[chunk], (void*)&r->ring[0], len - chunk);
-	} else
-		memcpy(p, (void*)&r->ring[rx], len);
-
-	rx = ARGO_RING_ALIGN(ARGO_RING_ALIGN(rx + len) % h->ring_len);
-
-	mb();	/* rx cannot be set out-of-order, thank you. */
-	r->rx_ptr = rx;
+	argo_ring_copy_out(h, buf, 0, len);
+	argo_ring_consume(h, len);
 
 	return len;
 }
 EXPORT_SYMBOL_GPL(argo_ring_recv);
 
+/*
+ * Pull one message off the ring into an sk_buff.
+ *
+ * The message is only consumed once it is fully copied into an skb. On
+ * failure rx_ptr stays put and the message is retried later: this carries
+ * SOCK_STREAM traffic, so silently dropping a message would punch a hole in
+ * the byte stream and wedge the peer forever.
+ *
+ * The skb is paged. A 64KB message would otherwise need an order-5 contiguous
+ * allocation, which fails routinely once the machine is under load.
+ */
+static struct sk_buff *argo_ring_recv_skb(struct argo_ring_hnd *h)
+{
+	struct xen_argo_ring_message_header mh;
+	struct sk_buff *skb;
+	size_t msg_len, avail, off;
+	int i, err = 0;
 
+	spin_lock(&h->ring_lock);
 
-static struct sk_buff* argo_ring_recv_skb(struct argo_ring_hnd* h) {
-    const struct xen_argo_ring_message_header mh;
-    struct sk_buff* skb = NULL;
-    size_t msg_len;
-    int rc = 0;
+	avail = argo_ring_has_data(h);
+	if (avail < sizeof(mh)) {
+		err = -ENODATA;
+		goto out;
+	}
 
-    spin_lock(&h->ring_lock);
+	argo_ring_copy_out(h, &mh, 0, sizeof(mh));
 
-    argo_ring_recv(h, &mh, sizeof(mh));
+	if (unlikely(mh.len < sizeof(mh) ||
+		     ARGO_RING_ALIGN(mh.len) > avail)) {
+		pr_err("Invalid packet, message size %u out of range (%zuB "
+			"available).\n", mh.len, avail);
+		err = -EPROTO;	/* ring is inconsistent, cannot resynchronise */
+		goto out;
+	}
+	msg_len = mh.len - sizeof(mh);
 
-    msg_len = mh->len - sizeof(mh);
-    if (unlikely(msg_len > argo_ring_has_data(h))) {
-        pr_err("Invalid packet, message size exceeds ring capacity %zu/%zu.\n",
-                msg_len, argo_ring_has_data(h));
-        rc = -E2BIG;
-        goto out;   /* ring deja inconsistent, nu putem drena în siguranță */
-    }
+	skb = alloc_skb_with_frags(sizeof(mh), msg_len, PAGE_ALLOC_COSTLY_ORDER,
+		&err, GFP_KERNEL | __GFP_NOWARN);
+	if (!skb) {
+		if (!err)
+			err = -ENOMEM;
+		goto out;
+	}
 
-    skb = alloc_skb(mh->len, GFP_KERNEL);
-    if (!skb) {
-        pr_err("Failed to allocate skb to receive message header with size %zu.\n", sizeof(*mh));
-        rc = -ENOMEM;
-        goto out;
-    }
+	memcpy(skb_put(skb, sizeof(mh)), &mh, sizeof(mh));
+	skb->len += msg_len;
+	skb->data_len = msg_len;
 
-    memcpy(skb_put(skb, sizeof(mh), &mh, sizeof(mh));
+	off = sizeof(mh);
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+		const size_t flen = skb_frag_size(frag);
 
-    if (msg_len)
-        argo_ring_recv(h, skb_put(skb, msg_len), msg_len);
+		argo_ring_copy_out(h, skb_frag_address(frag), off, flen);
+		off += flen;
+	}
 
-    spin_unlock(&h->ring_lock);
+	argo_ring_consume(h, ARGO_RING_ALIGN(mh.len));
+	spin_unlock(&h->ring_lock);
 
-    return skb;
+	return skb;
 
-drain:
-    /* msg_len a fost deja validat mai sus (< has_data), deci e sigur să
-     * consumăm exact atâția bytes din ring, ca rx_ptr să rămână corect. */
-    {
-        char scratch[128];
-        size_t remaining = msg_len;
-        while (remaining) {
-            size_t chunk = min(remaining, sizeof(scratch));
-            argo_ring_recv(h, scratch, chunk);
-            remaining -= chunk;
-        }
-    }
 out:
-    spin_unlock(&h->ring_lock);
-    if (skb)
-        kfree_skb(skb);
-    return ERR_PTR(rc);
+	spin_unlock(&h->ring_lock);
+	return ERR_PTR(err);
 }
+
+void argo_ring_schedule_recv(struct argo_ring_hnd *h, unsigned long delay)
+{
+	if (argo_recv_wq)
+		queue_delayed_work(argo_recv_wq, &h->recv_work, delay);
+}
+EXPORT_SYMBOL_GPL(argo_ring_schedule_recv);
 
 
 
@@ -403,22 +462,47 @@ EXPORT_SYMBOL_GPL(argo_get_local_cid);
 
 static void argo_recv_work_fn(struct work_struct *work)
 {
-    struct argo_ring_hnd *h = container_of(work, struct argo_ring_hnd, recv_work);
-    struct sk_buff *skb;
-    int rc;
+	struct argo_ring_hnd *h = container_of(to_delayed_work(work),
+		struct argo_ring_hnd, recv_work);
+	struct sk_buff *skb;
+	int rc;
 
-    while (argo_ring_has_data(h) >= sizeof(struct xen_argo_ring_message_header)) {
-        skb = argo_ring_recv_skb(h);
-        if (IS_ERR(skb)) {
-            pr_warn("Failed to retrieve packet from Argo ring (%ld).\n", -PTR_ERR(skb));
-            break;
-        }
-        rc = h->recv_cb(h->priv, skb);
-        if (rc) {
-            pr_warn("Failed to queue received packet, dropping.\n");
-            kfree_skb(skb);
-        }
-    }
+	for (;;) {
+		/* An skb the destination socket could not take last time. */
+		skb = skb_dequeue(&h->pending_skbs);
+		if (!skb) {
+			skb = argo_ring_recv_skb(h);
+			if (IS_ERR(skb)) {
+				rc = PTR_ERR(skb);
+				if (rc == -ENOMEM || rc == -ENOBUFS)
+					/* Message still in the ring: retry. */
+					argo_ring_schedule_recv(h,
+						ARGO_RECV_RETRY_DELAY);
+				else if (rc != -ENODATA)
+					pr_err("Ring dom%u:%u unusable (%d), "
+						"stopping receive.\n",
+						h->partner_id, h->aport, -rc);
+				break;
+			}
+		}
+
+		rc = h->recv_cb(h->priv, skb);
+		if (rc == -ENOBUFS) {
+			/*
+			 * Destination socket receive queue is full. Stop
+			 * draining the ring so that the sender blocks in
+			 * sendv() instead of us buffering without bound; the
+			 * reader kicks us again once it has made room.
+			 */
+			skb_queue_head(&h->pending_skbs, skb);
+			break;
+		}
+		if (rc) {
+			pr_warn_ratelimited(
+				"Failed to queue received packet, dropping.\n");
+			kfree_skb(skb);
+		}
+	}
 }
 #if 0
 static void argo_handle_event(struct tasklet_struct *t)
@@ -475,10 +559,17 @@ int argo_core_init(irqreturn_t (*argo_vsock_interrupt)(int, void *))
 	INIT_LIST_HEAD(&argo_rings);
 	rwlock_init(&argo_rings_lock);
 
+	argo_recv_wq = alloc_workqueue("argo_recv", WQ_UNBOUND | WQ_HIGHPRI, 0);
+	if (!argo_recv_wq)
+		return -ENOMEM;
+
 	rc = bind_virq_to_irqhandler(VIRQ_ARGO, 0, argo_vsock_interrupt, 0,
 		"argo", NULL);
-	if (rc < 0)
+	if (rc < 0) {
+		destroy_workqueue(argo_recv_wq);
+		argo_recv_wq = NULL;
 		return rc;
+	}
 
 	argo_irq = rc;
 	printk("Domid: %i\n", argo_get_local_cid());
@@ -489,10 +580,15 @@ EXPORT_SYMBOL_GPL(argo_core_init);
 
 void argo_core_cleanup(void)
 {
-	if (argo_irq < 0)
-		return;
+	if (argo_irq >= 0) {
+		unbind_from_irqhandler(argo_irq, NULL);
+		argo_irq = -1;
+	}
 
-	unbind_from_irqhandler(argo_irq, NULL);
+	if (argo_recv_wq) {
+		destroy_workqueue(argo_recv_wq);
+		argo_recv_wq = NULL;
+	}
 }
 EXPORT_SYMBOL_GPL(argo_core_cleanup);
 
