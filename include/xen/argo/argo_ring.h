@@ -1,9 +1,46 @@
 #ifndef _ARGO_RING_H_
 # define _ARGO_RING_H_
 
+#include <linux/log2.h>
+#include <linux/minmax.h>
 #include <linux/skbuff.h>
+#include <linux/time64.h>
 
 #include <xen/argo/argo.h>
+
+/*
+ * Latency instrumentation (temporary).
+ *
+ * A received byte crosses three contexts before userspace sees it:
+ *
+ *	Xen event -> argo_interrupt()		hard IRQ
+ *	          -> argo_recv_work_fn()	workqueue, process context
+ *	          -> sk_data_ready()		socket wakeup
+ *
+ * and the reply then crosses back out through sendv. Timestamping every
+ * boundary attributes a slow round-trip to one specific hop instead of
+ * leaving it to guesswork.
+ *
+ * Per-hop log2 histograms are kept unconditionally - two adds on a path that
+ * already does a hypercall - and dumped when the ring handle is freed.
+ * Individual round-trips are only logged when a hop crosses
+ * argo_lat_thresh_us, so a 1000-iteration ping-pong does not flood dmesg.
+ */
+#define ARGO_LAT_BUCKETS	16
+
+extern bool argo_lat_trace;
+extern unsigned int argo_lat_thresh_us;
+
+/* Bucket i covers [2^(i-1), 2^i) us; bucket 0 is everything under 1us. */
+static inline unsigned int argo_lat_bucket(u64 ns)
+{
+	u64 us = ns / NSEC_PER_USEC;
+
+	if (!us)
+		return 0;
+
+	return min_t(unsigned int, ilog2(us) + 1, ARGO_LAT_BUCKETS - 1);
+}
 
 /*
  * Ring GFN management.
@@ -50,7 +87,46 @@ struct argo_ring_hnd {
 			   vsock_sock/struct sock to recv_cb */
 	struct sk_buff_head pending_skbs;   /* packets waiting for process-context delivery */
 	struct delayed_work recv_work;
+
+	/*
+	 * TEMPORARY instrumentation, dumped once when the handle is freed.
+	 * Remove once the per-message cost is understood.
+	 */
+	u64 tx_calls;		/* sendv hypercalls issued */
+	u64 tx_eagain;		/* ... that returned -EAGAIN (target ring full) */
+	u64 tx_ns;		/* total time spent inside the hypercall */
+	u64 tx_ns_max;		/* worst single hypercall */
+	u64 rx_wakes;		/* recv worker invocations */
+	u64 rx_msgs;		/* messages pulled off the ring */
+	u64 rx_enobufs;		/* worker stalls on a full destination socket */
+	u64 rx_ns;		/* total time spent building skbs */
+
+	/*
+	 * Latency tracing, see the comment above ARGO_LAT_BUCKETS.
+	 *
+	 * lat_irq_ns is written by the interrupt handler and consumed by the
+	 * worker; it holds the *first* kick of a burst, which is the instant
+	 * the delay should be measured from. The rest are plain scratch for
+	 * the round-trip currently in flight.
+	 */
+	u64 lat_irq_ns;		/* IRQ saw data (0: no kick outstanding) */
+	u64 lat_start_ns;	/* IRQ timestamp of the run in progress */
+	u64 lat_work_ns;	/* worker entered */
+	u64 lat_ready_ns;	/* about to wake the reader */
+	u64 lat_logs;		/* slow round-trips logged so far */
+	u64 lat_n;		/* deliveries accounted */
+	u64 lat_recv_skb[ARGO_LAT_BUCKETS];	/* inside argo_ring_recv_skb() */
+	u64 lat_irq_work[ARGO_LAT_BUCKETS];	/* IRQ -> worker entry */
+	u64 lat_work_ready[ARGO_LAT_BUCKETS];	/* worker entry -> wakeup */
+	u64 lat_ready_send[ARGO_LAT_BUCKETS];	/* wakeup -> reply sendv */
+	u64 lat_sendv[ARGO_LAT_BUCKETS];	/* time inside the hypercall */
 };
+
+/*
+ * Record one receive hand-off. Called from the transport just before it wakes
+ * the reader, which is the last point still inside the kernel's control.
+ */
+void argo_lat_note_ready(struct argo_ring_hnd *h);
 
 /*
  * Ring handle primitives.
