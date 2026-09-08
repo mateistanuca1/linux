@@ -1,6 +1,9 @@
-#include <xen/page.h>
-#include <xen/events.h>
+/* SPDX-License-Identifier: GPL-2.0-only */
+#include <linux/version.h>
+
 #include <asm/xen/hypercall.h>
+#include <xen/events.h>
+#include <xen/page.h>
 #include <xen/xen.h>
 
 #ifndef HYPERVISOR_argo_op
@@ -27,7 +30,7 @@
 })
 #endif	/* _hypercall5*/
 
-#if ( LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0) )
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
 #define __xen_stac() stac()
 #define __xen_clac() clac()
 #endif
@@ -49,4 +52,4 @@ HYPERVISOR_argo_op(int cmd, void *arg1, void *arg2, uint32_t arg3,
 #define VIRQ_ARGO   11 /* G. (DOM0) ARGO interdomain communication */
 #endif
 
-#endif /* _ARGO_H_ */
+#endif /* !HYPERVISOR_argo_op */
