@@ -579,7 +579,8 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 		break;
 	case SOCK_STREAM:
 	case SOCK_SEQPACKET:
-		if (vsock_use_local_transport(remote_cid))
+		if (!(remote_flags & VMADDR_FLAG_NO_LOCAL) &&
+		    vsock_use_local_transport(remote_cid))
 			new_transport = transport_local;
 		else if (remote_cid <= VMADDR_CID_HOST || !transport_h2g ||
 			 (remote_flags & VMADDR_FLAG_TO_HOST))
@@ -1939,6 +1940,27 @@ static int vsock_listen(struct socket *sock, int backlog)
 
 	sk->sk_max_ack_backlog = backlog;
 	sk->sk_state = TCP_LISTEN;
+
+	/*
+	 * A transport that has to allocate resources before it can receive
+	 * connection requests needs one assigned by now; a socket that was
+	 * only bound does not have one yet.
+	 */
+	if (!vsk->transport) {
+		err = vsock_assign_transport(vsk, NULL);
+		if (err) {
+			sk->sk_state = TCP_CLOSE;
+			goto out;
+		}
+	}
+
+	if (vsk->transport->listen) {
+		err = vsk->transport->listen(vsk);
+		if (err) {
+			sk->sk_state = TCP_CLOSE;
+			goto out;
+		}
+	}
 
 	err = 0;
 
