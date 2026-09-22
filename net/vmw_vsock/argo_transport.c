@@ -194,10 +194,262 @@ static int argo_ring_send_skb(struct argo_ring_hnd *h,
 	return argo_ring_send(h, &iov, send, msg_type);
 }
 
+/*
+ * Queue a received ARGO_MSG_DATA message on a stream socket.
+ *
+ * Returns -ENOBUFS when the socket receive buffer is full. The caller must
+ * then hand the skb back to the ring layer untouched, which stops draining
+ * the ring: that is the only flow control this transport has, and without it
+ * a fast sender makes the receiver queue without bound until it runs out of
+ * memory. Caller holds lock_sock(sk).
+ */
+static int argo_transport_queue_data(struct sock *sk, struct sk_buff *skb)
+{
+	struct vsock_sock *vsk = vsock_sk(sk);
+	struct argo_transport *t = argo_trans(vsk);
+	size_t payload = skb->len - sizeof(struct xen_argo_ring_message_header);
+
+	if (sk->sk_shutdown & RCV_SHUTDOWN)
+		return -ECONNRESET;
+
+	/*
+	 * Always accept on an empty queue, so a message larger than buffer_size
+	 * cannot deadlock the ring.
+	 */
+	if (t->rx_bytes && t->rx_bytes + payload > vsk->buffer_size)
+		return -ENOBUFS;
+
+	skb_pull(skb, sizeof(struct xen_argo_ring_message_header));
+	ARGO_SKB_CB(skb)->offset = 0;
+	t->rx_bytes += skb->len;
+	skb_queue_tail(&sk->sk_receive_queue, skb);
+
+	sk->sk_data_ready(sk);
+
+	return 0;
+}
+
+/*
+ * Connections.
+ */
+
+static int argo_transport_stream_recv_cb(void *priv, void *data);
+static int argo_transport_stream_connect_recv_cb(void *priv, void *data);
+
+static int argo_transport_stream_listen(struct vsock_sock *vsk)
+{
+	struct argo_transport *t = argo_trans(vsk);
+	struct sockaddr_vm *addr = &vsk->local_addr;
+	int rc;
+
+	/* addr aliases vsk->local_addr, so this normalises it in place. */
+	if (sockaddr_vm_normalize(addr))
+		return -EINVAL;
+
+	sock_hold(&vsk->sk);
+	t->h = argo_ring_handle_alloc(addr->svm_cid, addr->svm_port,
+				      argo_transport_stream_connect_recv_cb,
+				      argo_transport_priv_put, vsk);
+	if (IS_ERR(t->h)) {
+		rc = PTR_ERR(t->h);
+		/*
+		 * Leaving the error pointer behind would get it dereferenced
+		 * by release(), which only checks that t->h is non-NULL.
+		 */
+		t->h = NULL;
+		sock_put(&vsk->sk);
+		return rc;
+	}
+
+	rc = argo_ring_register(t->h);
+	if (rc) {
+		argo_ring_handle_put(t->h);
+		t->h = NULL;
+		return rc;
+	}
+
+	return 0;
+}
+
+static int argo_transport_stream_connect_recv_cb(void *priv, void *data)
+{
+	struct vsock_sock *vsk = priv;
+	struct sk_buff *skb = data;
+	struct sock *sk = &vsk->sk;
+	struct xen_argo_ring_message_header *hdr = (void *)skb->data;
+	struct sock *connected_sk;
+	struct sockaddr_vm remote_addr;
+	struct sockaddr_vm local_addr;
+	int rc;
+
+	vsock_addr_init(&remote_addr, hdr->source.domain_id, hdr->source.aport);
+	vsock_addr_init(&local_addr, vsk->local_addr.svm_cid,
+			vsk->local_addr.svm_port);
+
+	if (hdr->message_type == ARGO_MSG_SYN) {
+		struct vsock_sock *child_vsk;
+		struct sk_buff *reply_skb;
+		xen_argo_send_addr_t reply_addr;
+		struct sock *child;
+
+		lock_sock(sk);
+
+		if (sk->sk_state != TCP_LISTEN) {
+			release_sock(sk);
+			return -ECONNREFUSED;
+		}
+		if (sk_acceptq_is_full(sk)) {
+			pr_warn("Accept queue full for dom%u:%u, dropping SYN.\n",
+				hdr->source.domain_id, hdr->source.aport);
+			release_sock(sk);
+			return -ENOMEM;
+		}
+		if (sk->sk_shutdown == SHUTDOWN_MASK) {
+			release_sock(sk);
+			return -ESHUTDOWN;
+		}
+
+		child = vsock_create_connected(sk);
+		if (!child) {
+			release_sock(sk);
+			return -ENOMEM;
+		}
+
+		/*
+		 * vsock_create_connected() hands back an unlocked socket. The
+		 * ordering documented in af_vsock.c is listener first, then the
+		 * pending child nested, so lockdep does not read the second
+		 * lock of the same class as recursion.
+		 */
+		lock_sock_nested(child, SINGLE_DEPTH_NESTING);
+
+		child->sk_state = TCP_ESTABLISHED;
+
+		child_vsk = vsock_sk(child);
+		vsock_addr_init(&child_vsk->local_addr, local_addr.svm_cid,
+				local_addr.svm_port);
+		vsock_addr_init(&child_vsk->remote_addr, remote_addr.svm_cid,
+				remote_addr.svm_port);
+
+		rc = vsock_assign_transport(child_vsk, vsk);
+		if (rc) {
+			release_sock(child);
+			sock_put(child);
+			release_sock(sk);
+			return rc;
+		}
+
+		/*
+		 * The child answers on the listener's ring, so it holds a
+		 * reference of its own: closing the listener first must not
+		 * take the ring away from an established connection.
+		 */
+		argo_ring_handle_get(argo_trans(vsk)->h);
+		argo_trans(child_vsk)->h = argo_trans(vsk)->h;
+
+		/*
+		 * Answer before the child goes on the accept queue: from that
+		 * point userspace can accept() and close() it, and the
+		 * addresses read here would be gone.
+		 */
+		reply_skb = alloc_skb(0, GFP_ATOMIC);
+		if (reply_skb) {
+			sockaddrvm_to_argo(&child_vsk->remote_addr,
+					   &reply_addr.dst);
+			sockaddrvm_to_argo(&child_vsk->local_addr,
+					   &reply_addr.src);
+
+			rc = argo_ring_send_skb(argo_trans(vsk)->h, reply_skb,
+						&reply_addr, ARGO_MSG_SYN_ACK);
+			kfree_skb(reply_skb);
+			if (rc < 0)
+				pr_warn("Failed to send SYN-ACK to dom%u:%u\n",
+					hdr->source.domain_id,
+					hdr->source.aport);
+		}
+
+		vsock_insert_connected(child_vsk);
+
+		vsock_enqueue_accept(sk, child);
+		sk_acceptq_added(sk);
+
+		release_sock(child);
+
+		sk->sk_data_ready(sk);
+		release_sock(sk);
+
+		return 0;
+	}
+
+	connected_sk = vsock_find_connected_socket(&remote_addr, &local_addr);
+	if (!connected_sk) {
+		pr_warn_ratelimited("No connected socket found for dom%u:%u\n",
+				    remote_addr.svm_cid, remote_addr.svm_port);
+		return -ECONNRESET;
+	}
+
+	lock_sock(connected_sk);
+
+	if (hdr->message_type == ARGO_MSG_FIN) {
+		connected_sk->sk_state = TCP_CLOSE;
+		connected_sk->sk_shutdown |= RCV_SHUTDOWN;
+		connected_sk->sk_state_change(connected_sk);
+		release_sock(connected_sk);
+		sock_put(connected_sk);
+		return 0;
+	}
+
+	rc = argo_transport_queue_data(connected_sk, skb);
+	release_sock(connected_sk);
+	sock_put(connected_sk);
+
+	return rc;
+}
+
+static int argo_transport_stream_recv_cb(void *priv, void *data)
+{
+	struct sk_buff *skb = data;
+	struct vsock_sock *vsk = priv;
+	struct sock *sk = &vsk->sk;
+	struct xen_argo_ring_message_header *hdr = (void *)skb->data;
+	int rc;
+
+	lock_sock(sk);
+
+	if (hdr->message_type == ARGO_MSG_SYN_ACK) {
+		vsock_insert_connected(vsk);
+		sk->sk_state = TCP_ESTABLISHED;
+		sk->sk_socket->state = SS_CONNECTED;
+		sk->sk_state_change(sk);
+		release_sock(sk);
+		kfree_skb(skb);
+		return 0;
+	}
+
+	if (hdr->message_type == ARGO_MSG_DATA) {
+		rc = argo_transport_queue_data(sk, skb);
+		release_sock(sk);
+		return rc;
+	}
+
+	if (hdr->message_type == ARGO_MSG_FIN) {
+		sk->sk_state = TCP_CLOSE;
+		sk->sk_shutdown |= RCV_SHUTDOWN;
+		sk->sk_state_change(sk);
+		kfree_skb(skb);
+	}
+	release_sock(sk);
+
+	return 0;
+}
+
 static int argo_transport_connect(struct vsock_sock *vsk)
 {
 	struct sock *sk = &vsk->sk;
+	struct argo_transport *t = argo_trans(vsk);
 	xen_argo_send_addr_t sendaddr;
+	struct sk_buff *skb;
+	int rc;
 
 	if (sockaddr_vm_normalize(&vsk->local_addr) ||
 	    sockaddr_vm_normalize(&vsk->remote_addr))
@@ -212,7 +464,41 @@ static int argo_transport_connect(struct vsock_sock *vsk)
 	if (!vsock_addr_bound(&vsk->remote_addr))
 		return -EINVAL;
 
-	sk->sk_state = TCP_ESTABLISHED;
+	if (sk->sk_type == SOCK_DGRAM) {
+		sk->sk_state = TCP_ESTABLISHED;
+		return 0;
+	}
+
+	/* Register a ring for the client side. */
+	sock_hold(sk);
+	t->h = argo_ring_handle_alloc(vsk->local_addr.svm_cid,
+				      vsk->local_addr.svm_port,
+				      argo_transport_stream_recv_cb,
+				      argo_transport_priv_put, vsk);
+	if (IS_ERR(t->h)) {
+		rc = PTR_ERR(t->h);
+		t->h = NULL;
+		sock_put(sk);
+		return rc;
+	}
+
+	rc = argo_ring_register(t->h);
+	if (rc) {
+		argo_ring_handle_put(t->h);
+		t->h = NULL;
+		return rc;
+	}
+
+	skb = alloc_skb(0, GFP_ATOMIC);
+	if (!skb)
+		return -ENOMEM;
+
+	rc = argo_ring_send_skb(t->h, skb, &sendaddr, ARGO_MSG_SYN);
+	kfree_skb(skb);
+	if (rc < 0)
+		return rc;
+
+	sk->sk_state = TCP_SYN_SENT;
 
 	return 0;
 }
@@ -378,6 +664,7 @@ static struct vsock_transport argo_transport = {
 	.release = argo_transport_release,
 
 	.connect = argo_transport_connect,
+	.listen = argo_transport_stream_listen,
 
 	.dgram_bind = argo_transport_dgram_bind,
 	.dgram_dequeue = argo_transport_dgram_dequeue,
