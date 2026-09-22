@@ -361,6 +361,75 @@ int argo_ring_recv(struct argo_ring_hnd *h, void *buf, size_t len)
 }
 EXPORT_SYMBOL_GPL(argo_ring_recv);
 
+/*
+ * Pull one message off the ring into an sk_buff.
+ *
+ * The message is only consumed once it is fully copied into an skb. On
+ * failure rx_ptr stays put and the message is retried later: this carries
+ * SOCK_STREAM traffic, so silently dropping a message would punch a hole in
+ * the byte stream and wedge the peer forever.
+ *
+ * The skb is paged. A 64KB message would otherwise need an order-5 contiguous
+ * allocation, which fails routinely once the machine is under load.
+ */
+static struct sk_buff *argo_ring_recv_skb(struct argo_ring_hnd *h)
+{
+	struct xen_argo_ring_message_header mh;
+	struct sk_buff *skb;
+	size_t msg_len, avail, off;
+	int i, err = 0;
+
+	spin_lock(&h->ring_lock);
+
+	avail = argo_ring_has_data(h);
+	if (avail < sizeof(mh)) {
+		err = -ENODATA;
+		goto out;
+	}
+
+	argo_ring_copy_out(h, &mh, 0, sizeof(mh));
+
+	if (unlikely(mh.len < sizeof(mh) ||
+		     ARGO_RING_ALIGN(mh.len) > avail)) {
+		pr_err("Invalid packet, message size %u out of range (%zuB available).\n",
+		       mh.len, avail);
+		/* The ring is inconsistent, it cannot be resynchronised. */
+		err = -EPROTO;
+		goto out;
+	}
+	msg_len = mh.len - sizeof(mh);
+
+	skb = alloc_skb_with_frags(sizeof(mh), msg_len, PAGE_ALLOC_COSTLY_ORDER,
+				   &err, GFP_KERNEL | __GFP_NOWARN);
+	if (!skb) {
+		if (!err)
+			err = -ENOMEM;
+		goto out;
+	}
+
+	memcpy(skb_put(skb, sizeof(mh)), &mh, sizeof(mh));
+	skb->len += msg_len;
+	skb->data_len = msg_len;
+
+	off = sizeof(mh);
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+		const size_t flen = skb_frag_size(frag);
+
+		argo_ring_copy_out(h, skb_frag_address(frag), off, flen);
+		off += flen;
+	}
+
+	argo_ring_consume(h, ARGO_RING_ALIGN(mh.len));
+	spin_unlock(&h->ring_lock);
+
+	return skb;
+
+out:
+	spin_unlock(&h->ring_lock);
+	return ERR_PTR(err);
+}
+
 MODULE_AUTHOR("Assured Information Security, Inc.");
 MODULE_DESCRIPTION("Xen Argo core ring primitives.");
 MODULE_LICENSE("GPL");
