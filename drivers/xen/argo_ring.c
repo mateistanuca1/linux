@@ -430,6 +430,59 @@ out:
 	return ERR_PTR(err);
 }
 
+int argo_ring_send(struct argo_ring_hnd *h, xen_argo_iov_t *iov,
+		   xen_argo_send_addr_t *send, uint32_t msg_type)
+{
+	int rc;
+
+	rc = HYPERVISOR_argo_op(XEN_ARGO_OP_sendv, send, iov, 1, msg_type);
+
+	/* -EAGAIN is normal back-pressure, do not log it per message. */
+	if (rc < 0 && rc != -EAGAIN)
+		pr_warn_ratelimited("Failed to send packet (%uB) through Argo to dom%u:%u (%d).\n",
+				    iov[0].iov_len, send->dst.domain_id,
+				    send->dst.aport, -rc);
+
+	return rc;
+}
+EXPORT_SYMBOL_GPL(argo_ring_send);
+
+domid_t argo_get_local_cid(void)
+{
+	domid_t domid = DOMID_INVALID;
+	struct evtchn_alloc_unbound op;
+	struct evtchn_status status;
+	struct evtchn_close close_op;
+	int rc;
+
+	/* Allocate an unbound event channel. */
+	op.dom = DOMID_SELF;
+	op.remote_dom = DOMID_SELF;
+	rc = HYPERVISOR_event_channel_op(EVTCHNOP_alloc_unbound, &op);
+	if (rc) {
+		pr_err("alloc_unbound failed with rc=%d\n", rc);
+		return domid;
+	}
+
+	/* Query the status of the port to find the real domid. */
+	status.dom = DOMID_SELF;
+	status.port = op.port;
+	rc = HYPERVISOR_event_channel_op(EVTCHNOP_status, &status);
+	if (rc)
+		pr_err("EVTCHNOP_status failed with rc=%d\n", rc);
+	else
+		domid = status.u.unbound.dom;
+
+	/* Clean up the port. */
+	close_op.port = op.port;
+	rc = HYPERVISOR_event_channel_op(EVTCHNOP_close, &close_op);
+	if (rc)
+		pr_warn("close_port %d failed rc=%d\n", op.port, rc);
+
+	return domid;
+}
+EXPORT_SYMBOL_GPL(argo_get_local_cid);
+
 MODULE_AUTHOR("Assured Information Security, Inc.");
 MODULE_DESCRIPTION("Xen Argo core ring primitives.");
 MODULE_LICENSE("GPL");
