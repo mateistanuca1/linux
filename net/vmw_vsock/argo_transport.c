@@ -224,6 +224,10 @@ static int argo_transport_queue_data(struct sock *sk, struct sk_buff *skb)
 	t->rx_bytes += skb->len;
 	skb_queue_tail(&sk->sk_receive_queue, skb);
 
+	/* Last point still under our control before userspace is woken. */
+	if (t->h)
+		argo_lat_note_ready(t->h);
+
 	sk->sk_data_ready(sk);
 
 	return 0;
@@ -665,6 +669,13 @@ static ssize_t argo_transport_stream_dequeue(struct vsock_sock *vsk,
 	size_t copied = 0;
 	int err = 0;
 
+	/*
+	 * First point at which the reader is demonstrably running again, so it
+	 * is where the wakeup ends and the application's own time begins.
+	 */
+	if (t->h)
+		argo_lat_note_dequeue(t->h);
+
 	if (flags & MSG_PEEK) {
 		skb_queue_walk(&sk->sk_receive_queue, skb) {
 			u32 off = ARGO_SKB_CB(skb)->offset;
@@ -973,6 +984,7 @@ static irqreturn_t argo_interrupt(int irq, void *dev_id)
 	list_for_each_entry_safe(h, tmp, &argo_rings, l) {
 		if (argo_ring_has_data(h) >=
 		    sizeof(struct xen_argo_ring_message_header)) {
+			argo_lat_note_irq(h);
 			argo_ring_schedule_recv(h, 0);
 		}
 	}

@@ -10,6 +10,42 @@
 
 #include <xen/argo/argo.h>
 
+#ifdef CONFIG_XEN_ARGO_LATENCY_TRACE
+#include <linux/ktime.h>
+#include <linux/log2.h>
+#include <linux/minmax.h>
+#include <linux/time64.h>
+
+/*
+ * Latency tracing.
+ *
+ * A received byte crosses three contexts before userspace sees it:
+ *
+ *	Xen event -> argo_interrupt()		hard IRQ
+ *	          -> argo_recv_work_fn()	workqueue, process context
+ *	          -> sk_data_ready()		socket wakeup
+ *
+ * and the reply crosses back out through sendv. Timestamping every boundary
+ * attributes a slow round trip to one hop instead of leaving it to guesswork.
+ *
+ * Per-hop log2 histograms are dumped when the ring handle is freed. Logging an
+ * individual round trip is off by default: a line on a console costs more than
+ * the round trip it describes, so switching it on changes the answer.
+ */
+#define ARGO_LAT_BUCKETS	16
+
+/* Bucket i covers [2^(i-1), 2^i) us; bucket 0 is everything under 1us. */
+static inline unsigned int argo_lat_bucket(u64 ns)
+{
+	u64 us = ns / NSEC_PER_USEC;
+
+	if (!us)
+		return 0;
+
+	return min_t(unsigned int, ilog2(us) + 1, ARGO_LAT_BUCKETS - 1);
+}
+#endif /* CONFIG_XEN_ARGO_LATENCY_TRACE */
+
 /*
  * Ring GFN management.
  */
@@ -76,6 +112,43 @@ struct argo_ring_hnd {
 	struct sk_buff_head pending_skbs;
 	struct delayed_work recv_work;
 
+#ifdef CONFIG_XEN_ARGO_LATENCY_TRACE
+	u64 tx_calls;		/* sendv hypercalls issued */
+	u64 tx_eagain;		/* ... that returned -EAGAIN (target ring full) */
+	u64 tx_ns;		/* total time spent inside the hypercall */
+	u64 tx_ns_max;		/* worst single hypercall */
+	u64 rx_wakes;		/* receive worker invocations */
+	u64 rx_msgs;		/* messages pulled off the ring */
+	u64 rx_enobufs;		/* worker stalls on a full destination socket */
+	u64 rx_ns;		/* total time spent building skbs */
+
+	/*
+	 * lat_irq_ns is written by the interrupt handler and consumed by the
+	 * worker; it holds the *first* kick of a burst, which is the instant
+	 * the delay should be measured from. The rest are scratch for the
+	 * round trip currently in flight.
+	 */
+	u64 lat_irq_ns;		/* IRQ saw data (0: no kick outstanding) */
+	u64 lat_start_ns;	/* IRQ timestamp of the run in progress */
+	u64 lat_work_ns;	/* worker entered */
+	u64 lat_ready_ns;	/* about to wake the reader */
+	u64 lat_deq_ns;		/* reader reached stream_dequeue() */
+	u64 lat_logs;		/* slow round trips logged so far */
+	u64 lat_n;		/* deliveries accounted */
+	u64 lat_recv_skb[ARGO_LAT_BUCKETS];	/* inside argo_ring_recv_skb() */
+	u64 lat_irq_work[ARGO_LAT_BUCKETS];	/* IRQ -> worker entry */
+	u64 lat_work_ready[ARGO_LAT_BUCKETS];	/* worker entry -> wakeup */
+	/*
+	 * Wakeup to reply sendv, and the same interval split at the moment the
+	 * reader reaches the transport. The two halves have different owners:
+	 * ready->deq is the scheduler getting the reader onto a CPU, deq->sendv
+	 * is the application.
+	 */
+	u64 lat_ready_deq[ARGO_LAT_BUCKETS];	/* wakeup -> reader running */
+	u64 lat_deq_send[ARGO_LAT_BUCKETS];	/* reader running -> reply */
+	u64 lat_ready_send[ARGO_LAT_BUCKETS];	/* wakeup -> reply (total) */
+	u64 lat_sendv[ARGO_LAT_BUCKETS];	/* time inside the hypercall */
+#endif
 };
 
 /*
@@ -84,6 +157,47 @@ struct argo_ring_hnd {
  * Every one of these compiles to nothing without
  * CONFIG_XEN_ARGO_LATENCY_TRACE, so call sites stay free of #ifdef.
  */
+#ifdef CONFIG_XEN_ARGO_LATENCY_TRACE
+
+extern bool argo_lat_trace;
+
+static inline u64 argo_lat_now(void)
+{
+	return argo_lat_trace ? ktime_get_ns() : 0;
+}
+
+/* The interrupt handler found data on this ring. */
+void argo_lat_note_irq(struct argo_ring_hnd *h);
+/* The receive worker started running. */
+void argo_lat_note_work(struct argo_ring_hnd *h);
+/* One attempt to pull a message off the ring finished, successfully or not. */
+void argo_lat_note_recv_skb(struct argo_ring_hnd *h, u64 t0,
+			    const struct sk_buff *skb);
+/* About to wake the reader: the last point still under the kernel's control. */
+void argo_lat_note_ready(struct argo_ring_hnd *h);
+/* The reader reached the transport, so it is demonstrably running again. */
+void argo_lat_note_dequeue(struct argo_ring_hnd *h);
+/* A sendv hypercall returned. */
+void argo_lat_note_send(struct argo_ring_hnd *h, u64 t0, int rc);
+/* The destination socket was full and the worker parked the message. */
+void argo_lat_note_enobufs(struct argo_ring_hnd *h);
+/* Print every histogram collected for this ring. */
+void argo_lat_dump(const struct argo_ring_hnd *h);
+
+#else /* !CONFIG_XEN_ARGO_LATENCY_TRACE */
+
+static inline u64 argo_lat_now(void) { return 0; }
+static inline void argo_lat_note_irq(struct argo_ring_hnd *h) { }
+static inline void argo_lat_note_work(struct argo_ring_hnd *h) { }
+static inline void argo_lat_note_recv_skb(struct argo_ring_hnd *h, u64 t0,
+					  const struct sk_buff *skb) { }
+static inline void argo_lat_note_ready(struct argo_ring_hnd *h) { }
+static inline void argo_lat_note_dequeue(struct argo_ring_hnd *h) { }
+static inline void argo_lat_note_send(struct argo_ring_hnd *h, u64 t0, int rc) { }
+static inline void argo_lat_note_enobufs(struct argo_ring_hnd *h) { }
+static inline void argo_lat_dump(const struct argo_ring_hnd *h) { }
+
+#endif /* CONFIG_XEN_ARGO_LATENCY_TRACE */
 
 /*
  * Ring handle primitives.

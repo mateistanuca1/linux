@@ -44,6 +44,244 @@ static struct workqueue_struct *argo_recv_wq;
 
 static void argo_recv_work_fn(struct work_struct *work);
 
+#ifdef CONFIG_XEN_ARGO_LATENCY_TRACE
+
+bool argo_lat_trace = true;
+module_param_named(lat_trace, argo_lat_trace, bool, 0644);
+MODULE_PARM_DESC(lat_trace, "Timestamp the receive path (default on)");
+EXPORT_SYMBOL_GPL(argo_lat_trace);
+
+/*
+ * Zero disables per-round-trip logging, which is the right default: a line on
+ * a console costs more than the round trip it describes and lands in the
+ * middle of the path being timed, so switching it on changes the answer. Read
+ * the histograms first; set a threshold here only to catch a specific outlier.
+ */
+static unsigned int argo_lat_thresh_us;
+module_param_named(lat_thresh_us, argo_lat_thresh_us, uint, 0644);
+MODULE_PARM_DESC(lat_thresh_us,
+		 "Log a round trip when a hop exceeds this many us (0: off)");
+
+/* Cap on individual slow-path lines, so a pathological run cannot flood. */
+static unsigned int argo_lat_max_logs = 200;
+module_param_named(lat_max_logs, argo_lat_max_logs, uint, 0644);
+MODULE_PARM_DESC(lat_max_logs, "Stop logging after this many slow round trips");
+
+void argo_lat_note_irq(struct argo_ring_hnd *h)
+{
+	u64 now = argo_lat_now();
+
+	/*
+	 * Keep the first kick of a burst: if the worker has not run since,
+	 * that is the instant the delay should be measured from.
+	 */
+	if (now && !READ_ONCE(h->lat_irq_ns))
+		WRITE_ONCE(h->lat_irq_ns, now);
+}
+EXPORT_SYMBOL_GPL(argo_lat_note_irq);
+
+void argo_lat_note_work(struct argo_ring_hnd *h)
+{
+	if (!argo_lat_trace)
+		return;
+
+	h->rx_wakes++;
+	h->lat_work_ns = ktime_get_ns();
+	/*
+	 * Consume the interrupt timestamp: a kick arriving while this run is
+	 * in progress belongs to the next run, and xchg() keeps the two from
+	 * being confused.
+	 */
+	h->lat_start_ns = xchg(&h->lat_irq_ns, 0);
+}
+EXPORT_SYMBOL_GPL(argo_lat_note_work);
+
+void argo_lat_note_recv_skb(struct argo_ring_hnd *h, u64 t0,
+			    const struct sk_buff *skb)
+{
+	u64 dt;
+
+	if (!argo_lat_trace)
+		return;
+
+	dt = ktime_get_ns() - t0;
+	h->rx_ns += dt;
+
+	/*
+	 * Only successful pulls count. Every worker run ends on -ENODATA, and
+	 * those samples otherwise outnumber the real ones two to one and hide
+	 * the tail this histogram exists to show.
+	 */
+	if (!IS_ERR(skb)) {
+		h->rx_msgs++;
+		h->lat_recv_skb[argo_lat_bucket(dt)]++;
+	}
+}
+EXPORT_SYMBOL_GPL(argo_lat_note_recv_skb);
+
+void argo_lat_note_enobufs(struct argo_ring_hnd *h)
+{
+	h->rx_enobufs++;
+}
+EXPORT_SYMBOL_GPL(argo_lat_note_enobufs);
+
+void argo_lat_note_ready(struct argo_ring_hnd *h)
+{
+	u64 now, d_irq_work, d_work_ready;
+
+	if (!argo_lat_trace)
+		return;
+
+	now = ktime_get_ns();
+	h->lat_ready_ns = now;
+	/* Stale from a delivery the reader never came back for. */
+	h->lat_deq_ns = 0;
+	h->lat_n++;
+
+	/*
+	 * lat_start_ns is zero when the worker ran without an interrupt behind
+	 * it - the reader-side kick from stream_dequeue(). Those say nothing
+	 * about wakeup latency, so only the second hop is accounted.
+	 */
+	d_irq_work = h->lat_start_ns ? h->lat_work_ns - h->lat_start_ns : 0;
+	d_work_ready = now - h->lat_work_ns;
+
+	if (h->lat_start_ns)
+		h->lat_irq_work[argo_lat_bucket(d_irq_work)]++;
+	h->lat_work_ready[argo_lat_bucket(d_work_ready)]++;
+
+	if (argo_lat_thresh_us &&
+	    (d_irq_work / NSEC_PER_USEC > argo_lat_thresh_us ||
+	     d_work_ready / NSEC_PER_USEC > argo_lat_thresh_us) &&
+	    h->lat_logs++ < argo_lat_max_logs)
+		pr_info("lat dom%u:%u recv#%llu: irq->work %llu us, work->ready %llu us\n",
+			h->partner_id, h->aport, h->lat_n,
+			d_irq_work / NSEC_PER_USEC,
+			d_work_ready / NSEC_PER_USEC);
+}
+EXPORT_SYMBOL_GPL(argo_lat_note_ready);
+
+void argo_lat_note_dequeue(struct argo_ring_hnd *h)
+{
+	u64 ready, now, d;
+
+	if (!argo_lat_trace)
+		return;
+
+	/*
+	 * Only the first dequeue after a delivery says anything about wakeup
+	 * latency; a reader draining the queue in several recv() calls is
+	 * already running by the second one. A dequeue with no delivery behind
+	 * it - data queued before the reader ever blocked - is not a wakeup.
+	 */
+	ready = h->lat_ready_ns;
+	if (!ready || h->lat_deq_ns)
+		return;
+
+	now = ktime_get_ns();
+	h->lat_deq_ns = now;
+
+	d = now - ready;
+	h->lat_ready_deq[argo_lat_bucket(d)]++;
+
+	if (argo_lat_thresh_us && d / NSEC_PER_USEC > argo_lat_thresh_us &&
+	    h->lat_logs++ < argo_lat_max_logs)
+		pr_info("lat dom%u:%u recv#%llu: ready->deq %llu us\n",
+			h->partner_id, h->aport, h->lat_n, d / NSEC_PER_USEC);
+}
+EXPORT_SYMBOL_GPL(argo_lat_note_dequeue);
+
+void argo_lat_note_send(struct argo_ring_hnd *h, u64 t0, int rc)
+{
+	u64 ready, deq, turn, app, dt;
+
+	if (!argo_lat_trace)
+		return;
+
+	h->tx_calls++;
+	if (rc == -EAGAIN)
+		h->tx_eagain++;
+
+	dt = ktime_get_ns() - t0;
+	h->tx_ns += dt;
+	if (dt > h->tx_ns_max)
+		h->tx_ns_max = dt;
+
+	/*
+	 * On an echo server this send is the reply to the last thing
+	 * delivered, so ready->sendv is the userspace turnaround plus the
+	 * scheduling latency of waking the reader. Consumed once: a send with
+	 * no delivery behind it is not a turnaround.
+	 *
+	 * app is the application's own half of that, from the reader reaching
+	 * the transport to the reply leaving; whatever is in turn but not in
+	 * app is the scheduler getting the reader onto a CPU.
+	 */
+	ready = xchg(&h->lat_ready_ns, 0);
+	deq = xchg(&h->lat_deq_ns, 0);
+	turn = (ready && t0 > ready) ? t0 - ready : 0;
+	app = (deq && t0 > deq) ? t0 - deq : 0;
+
+	h->lat_sendv[argo_lat_bucket(dt)]++;
+	if (turn)
+		h->lat_ready_send[argo_lat_bucket(turn)]++;
+	if (app)
+		h->lat_deq_send[argo_lat_bucket(app)]++;
+
+	if (argo_lat_thresh_us &&
+	    (turn / NSEC_PER_USEC > argo_lat_thresh_us ||
+	     dt / NSEC_PER_USEC > argo_lat_thresh_us) &&
+	    h->lat_logs++ < argo_lat_max_logs)
+		pr_info("lat dom%u:%u send: ready->sendv %llu us (deq->sendv %llu us), sendv %llu us, rc %d\n",
+			h->partner_id, h->aport, turn / NSEC_PER_USEC,
+			app / NSEC_PER_USEC, dt / NSEC_PER_USEC, rc);
+}
+EXPORT_SYMBOL_GPL(argo_lat_note_send);
+
+static void argo_lat_dump_one(const struct argo_ring_hnd *h, const char *what,
+			      const u64 *hist)
+{
+	char buf[ARGO_LAT_BUCKETS * 12];
+	int i, n = 0;
+
+	for (i = 0; i < ARGO_LAT_BUCKETS; i++) {
+		if (!hist[i])
+			continue;
+		n += scnprintf(buf + n, sizeof(buf) - n, " %u:%llu",
+			       i ? 1u << (i - 1) : 0, hist[i]);
+	}
+	if (!n)
+		return;
+
+	/* "<us-lower-bound>:<count>", so 4096:37 means 37 samples in 4-8ms. */
+	pr_info("ring dom%u:%u %-12s us:count%s\n",
+		h->partner_id, h->aport, what, buf);
+}
+
+void argo_lat_dump(const struct argo_ring_hnd *h)
+{
+	if (!h->lat_n)
+		return;
+
+	pr_info("ring dom%u:%u stats: tx %llu calls (%llu EAGAIN) avg %llu ns max %llu ns | rx %llu msgs in %llu wakes, avg %llu ns, %llu ENOBUFS stalls\n",
+		h->partner_id, h->aport, h->tx_calls, h->tx_eagain,
+		h->tx_calls ? h->tx_ns / h->tx_calls : 0, h->tx_ns_max,
+		h->rx_msgs, h->rx_wakes,
+		h->rx_msgs ? h->rx_ns / h->rx_msgs : 0, h->rx_enobufs);
+
+	argo_lat_dump_one(h, "recv_skb", h->lat_recv_skb);
+	argo_lat_dump_one(h, "irq->work", h->lat_irq_work);
+	argo_lat_dump_one(h, "work->ready", h->lat_work_ready);
+	/* The two halves first, then the total they add up to. */
+	argo_lat_dump_one(h, "ready->deq", h->lat_ready_deq);
+	argo_lat_dump_one(h, "deq->sendv", h->lat_deq_send);
+	argo_lat_dump_one(h, "ready->sendv", h->lat_ready_send);
+	argo_lat_dump_one(h, "sendv", h->lat_sendv);
+}
+EXPORT_SYMBOL_GPL(argo_lat_dump);
+
+#endif /* CONFIG_XEN_ARGO_LATENCY_TRACE */
+
 /*
  * Ring management helpers.
  */
@@ -236,6 +474,8 @@ static void argo_ring_handle_release(struct kref *kref)
 	cancel_delayed_work_sync(&h->recv_work);
 	argo_ring_unregister(h);
 	skb_queue_purge(&h->pending_skbs);
+
+	argo_lat_dump(h);
 
 	if (h->priv_put)
 		h->priv_put(h->priv);
@@ -467,9 +707,12 @@ EXPORT_SYMBOL_GPL(argo_ring_schedule_recv);
 int argo_ring_send(struct argo_ring_hnd *h, xen_argo_iov_t *iov,
 		   xen_argo_send_addr_t *send, uint32_t msg_type)
 {
+	u64 t0 = argo_lat_now();
 	int rc;
 
 	rc = HYPERVISOR_argo_op(XEN_ARGO_OP_sendv, send, iov, 1, msg_type);
+
+	argo_lat_note_send(h, t0, rc);
 
 	/* -EAGAIN is normal back-pressure, do not log it per message. */
 	if (rc < 0 && rc != -EAGAIN)
@@ -528,11 +771,16 @@ static void argo_recv_work_fn(struct work_struct *work)
 	struct sk_buff *skb;
 	int rc;
 
+	argo_lat_note_work(h);
+
 	for (;;) {
 		/* An skb the destination socket could not take last time. */
 		skb = skb_dequeue(&h->pending_skbs);
 		if (!skb) {
+			u64 t0 = argo_lat_now();
+
 			skb = argo_ring_recv_skb(h);
+			argo_lat_note_recv_skb(h, t0, skb);
 			if (IS_ERR(skb)) {
 				rc = PTR_ERR(skb);
 				if (rc == -ENOMEM || rc == -ENOBUFS)
@@ -554,6 +802,7 @@ static void argo_recv_work_fn(struct work_struct *work)
 			 * sendv() instead of us buffering without bound; the
 			 * reader kicks us again once it has made room.
 			 */
+			argo_lat_note_enobufs(h);
 			skb_queue_head(&h->pending_skbs, skb);
 			break;
 		}
