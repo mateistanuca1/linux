@@ -150,8 +150,13 @@ static int sockaddrvm_to_argo(const struct sockaddr_vm *s, xen_argo_addr_t *d)
 	if (sockaddr_vm_normalize(&c))
 		return -EINVAL;
 
-	d->domain_id = s->svm_cid;
-	d->aport = s->svm_port;
+	/*
+	 * From the normalised copy, not from *s: a wildcard address has to
+	 * reach Xen as XEN_ARGO_DOMID_ANY, and reading *s here would send it
+	 * the raw VMADDR_CID_ANY instead - which is domain 0, dom0.
+	 */
+	d->domain_id = c.svm_cid;
+	d->aport = c.svm_port;
 	d->pad = 0;
 
 	return 0;
@@ -207,6 +212,11 @@ static int argo_transport_queue_data(struct sock *sk, struct sk_buff *skb)
 	ARGO_SKB_CB(skb)->offset = 0;
 	t->rx_bytes += skb->len;
 	skb_queue_tail(&sk->sk_receive_queue, skb);
+
+	/* Last point still under our control before userspace is woken. */
+	if (t->h)
+		argo_lat_note_ready(t->h);
+
 	sk->sk_data_ready(sk);
 
 	return 0;
@@ -225,17 +235,23 @@ static int argo_transport_stream_listen(struct vsock_sock *vsk)
 	struct sockaddr_vm *addr = &vsk->local_addr;
 	int rc;
 
+	/* addr aliases vsk->local_addr, so this normalises it in place. */
 	if (sockaddr_vm_normalize(addr))
 		return -EINVAL;
-
-	memcpy(&vsk->local_addr, addr, sizeof(*addr));
 
 	t->h = argo_ring_handle_alloc(addr->svm_cid, addr->svm_port,
 				      argo_transport_stream_connect_recv_cb,
 				      vsk);
+	if (IS_ERR(t->h)) {
+		rc = PTR_ERR(t->h);
+		/*
+		 * Leaving the error pointer behind would get it dereferenced
+		 * by release(), which only checks that t->h is non-NULL.
+		 */
+		t->h = NULL;
+		return rc;
+	}
 	t->is_ring_owner = true;
-	if (IS_ERR(t->h))
-		return PTR_ERR(t->h);
 
 	rc = argo_ring_register(t->h);
 	if (rc) {
@@ -287,6 +303,14 @@ static int argo_transport_stream_connect_recv_cb(void *priv, void *data)
 			return -ENOMEM;
 		}
 
+		/*
+		 * vsock_create_connected() hands back an unlocked socket. The
+		 * ordering documented in af_vsock.c is listener first, then the
+		 * pending child nested, so lockdep does not read the second
+		 * lock of the same class as recursion.
+		 */
+		lock_sock_nested(child, SINGLE_DEPTH_NESTING);
+
 		child->sk_state = TCP_ESTABLISHED;
 
 		child_vsk = vsock_sk(child);
@@ -299,19 +323,18 @@ static int argo_transport_stream_connect_recv_cb(void *priv, void *data)
 		if (rc) {
 			release_sock(child);
 			sock_put(child);
+			release_sock(sk);
 			return rc;
 		}
 
 		argo_trans(child_vsk)->h = argo_trans(vsk)->h;
 		argo_trans(child_vsk)->is_ring_owner = false;
 
-		vsock_insert_connected(child_vsk);
-
-		vsock_enqueue_accept(sk, child);
-		sk_acceptq_added(sk);
-		sk->sk_data_ready(sk);
-		release_sock(sk);
-
+		/*
+		 * Answer before the child goes on the accept queue: from that
+		 * point userspace can accept() and close() it, and the
+		 * addresses read here would be gone.
+		 */
 		reply_skb = alloc_skb(0, GFP_ATOMIC);
 		if (reply_skb) {
 			sockaddrvm_to_argo(&child_vsk->remote_addr,
@@ -322,13 +345,21 @@ static int argo_transport_stream_connect_recv_cb(void *priv, void *data)
 			rc = argo_ring_send_skb(argo_trans(vsk)->h, reply_skb,
 						&reply_addr, ARGO_MSG_SYN_ACK);
 			kfree_skb(reply_skb);
-			if (rc < 0) {
+			if (rc < 0)
 				pr_warn("Failed to send SYN-ACK to dom%u:%u\n",
 					hdr->source.domain_id,
 					hdr->source.aport);
-				return rc;
-			}
 		}
+
+		vsock_insert_connected(child_vsk);
+
+		vsock_enqueue_accept(sk, child);
+		sk_acceptq_added(sk);
+
+		release_sock(child);
+
+		sk->sk_data_ready(sk);
+		release_sock(sk);
 
 		return 0;
 	}
@@ -425,9 +456,12 @@ static int argo_transport_connect(struct vsock_sock *vsk)
 	t->h = argo_ring_handle_alloc(vsk->local_addr.svm_cid,
 				      vsk->local_addr.svm_port,
 				      argo_transport_stream_recv_cb, vsk);
+	if (IS_ERR(t->h)) {
+		rc = PTR_ERR(t->h);
+		t->h = NULL;
+		return rc;
+	}
 	t->is_ring_owner = true;
-	if (IS_ERR(t->h))
-		return PTR_ERR(t->h);
 
 	rc = argo_ring_register(t->h);
 	if (rc) {
@@ -469,13 +503,14 @@ static int argo_transport_dgram_bind(struct vsock_sock *vsk,
 
 	t->h = argo_ring_handle_alloc(addr->svm_cid, addr->svm_port,
 				      argo_transport_recv_dgram_cb, vsk);
-	t->is_ring_owner = true;
 	if (IS_ERR(t->h)) {
 		rc = PTR_ERR(t->h);
 		pr_debug("argo_ring_handle_alloc(dom%u:%u) failed (%d).\n",
 			 addr->svm_cid, addr->svm_port, -rc);
+		t->h = NULL;
 		return rc;
 	}
+	t->is_ring_owner = true;
 
 	rc = argo_ring_register(t->h);
 	if (rc) {
@@ -608,6 +643,13 @@ static ssize_t argo_transport_stream_dequeue(struct vsock_sock *vsk,
 	struct sk_buff *skb;
 	size_t copied = 0;
 	int err = 0;
+
+	/*
+	 * First point at which the reader is demonstrably running again, so it
+	 * is where the wakeup ends and the application's own time begins.
+	 */
+	if (t->h)
+		argo_lat_note_dequeue(t->h);
 
 	if (flags & MSG_PEEK) {
 		skb_queue_walk(&sk->sk_receive_queue, skb) {
@@ -916,8 +958,10 @@ static irqreturn_t argo_interrupt(int irq, void *dev_id)
 	read_lock(&argo_rings_lock);
 	list_for_each_entry_safe(h, tmp, &argo_rings, l) {
 		if (argo_ring_has_data(h) >=
-		    sizeof(struct xen_argo_ring_message_header))
+		    sizeof(struct xen_argo_ring_message_header)) {
+			argo_lat_note_irq(h);
 			argo_ring_schedule_recv(h, 0);
+		}
 	}
 	read_unlock(&argo_rings_lock);
 
