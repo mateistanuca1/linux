@@ -372,4 +372,37 @@ config XEN_VIRTIO_FORCE_GRANT
 	  of the guest memory. This will need support on the backend side
 	  (e.g. qemu or kernel, depending on the virtio device types used).
 
+config XEN_ARGO
+	tristate "Xen Argo ring primitives"
+	depends on XEN && X86
+	help
+	  Enable core Xen Argo primitives and hypercall wrappers.
+
+	  Argo is a hypervisor-mediated interdomain transport: the hypervisor
+	  copies each message between registered rings, so no memory is ever
+	  shared between the two domains.
+
+	  This provides the ring layer only. Say Y if you intend to enable a
+	  transport built on it, such as XEN_ARGO_VSOCKETS.
+
+config XEN_ARGO_LATENCY_TRACE
+	bool "Xen Argo latency tracing"
+	depends on XEN_ARGO
+	help
+	  Timestamp every hop a received message crosses - hard interrupt to
+	  worker, worker to socket wakeup, wakeup to the reply hypercall - and
+	  keep a log2 histogram of each. The histograms are dumped when a ring
+	  handle is freed, which is when the socket closes.
+
+	  This answers "where did the microseconds go" without needing a
+	  hypervisor-side trace, at the cost of a timestamp read per hop. The
+	  cost is real but small: about half a microsecond per round trip out
+	  of roughly eighty on unnested hardware.
+
+	  The lat_trace module parameter switches the timestamping off at
+	  runtime, so a build with this enabled can still be measured against
+	  itself to find out what the instrumentation costs.
+
+	  Say N unless you are profiling the transport.
+
 endmenu
