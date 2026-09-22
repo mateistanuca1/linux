@@ -72,6 +72,9 @@ struct argo_ring_hnd {
 	argo_priv_put_cb priv_put;
 	/* Opaque owner, passed back to recv_cb. Pinned for the ring's life. */
 	void *priv;
+	/* Packets waiting for process-context delivery. */
+	struct sk_buff_head pending_skbs;
+	struct delayed_work recv_work;
 
 };
 
@@ -107,5 +110,16 @@ domid_t argo_get_local_cid(void);
 int argo_ring_send(struct argo_ring_hnd *h, xen_argo_iov_t *iov,
 		   xen_argo_send_addr_t *send, uint32_t msg_type);
 int argo_ring_recv(struct argo_ring_hnd *h, void *buf, size_t len);
+
+/*
+ * Kick the receive worker for this ring. Used by the interrupt handler when
+ * new data lands, and by the reader side once it has freed room in the socket
+ * receive queue: ring consumption stops while the destination socket is full,
+ * so nothing else would restart it.
+ */
+void argo_ring_schedule_recv(struct argo_ring_hnd *h, unsigned long delay);
+
+int argo_core_init(irqreturn_t (*argo_vsock_interrupt)(int, void *));
+void argo_core_cleanup(void);
 
 #endif /* !_ARGO_RING_H_ */
