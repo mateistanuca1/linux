@@ -63,6 +63,8 @@
 #define __HYPERVISOR_kexec_op             37
 #define __HYPERVISOR_tmem_op              38
 #define __HYPERVISOR_xc_reserved_op       39 /* reserved for XenClient */
+/* Argo took over the slot the XenClient reservation left unused. */
+#define __HYPERVISOR_argo_op              39
 #define __HYPERVISOR_xenpmu_op            40
 #define __HYPERVISOR_dm_op                41
 
@@ -96,6 +98,7 @@
 #define VIRQ_PCPU_STATE 9  /* G. (DOM0) PCPU state changed                   */
 #define VIRQ_MEM_EVENT  10 /* G. (DOM0) A memory event has occured           */
 #define VIRQ_XC_RESERVED 11 /* G. Reserved for XenClient                     */
+#define VIRQ_ARGO       11 /* G. Argo interdomain message notification       */
 #define VIRQ_ENOMEM     12 /* G. (DOM0) Low on heap memory       */
 #define VIRQ_XENPMU     13  /* PMC interrupt                                 */
 
