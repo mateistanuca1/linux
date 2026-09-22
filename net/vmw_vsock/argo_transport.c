@@ -652,6 +652,188 @@ static bool argo_transport_dgram_allow(struct vsock_sock *vsk, u32 cid,
 	return true;
 }
 
+/*
+ * STREAM.
+ */
+static ssize_t argo_transport_stream_dequeue(struct vsock_sock *vsk,
+					     struct msghdr *msg, size_t len,
+					     int flags)
+{
+	struct sock *sk = &vsk->sk;
+	struct argo_transport *t = argo_trans(vsk);
+	struct sk_buff *skb;
+	size_t copied = 0;
+	int err = 0;
+
+	if (flags & MSG_PEEK) {
+		skb_queue_walk(&sk->sk_receive_queue, skb) {
+			u32 off = ARGO_SKB_CB(skb)->offset;
+			size_t chunk = min_t(size_t, skb->len - off,
+					     len - copied);
+
+			err = skb_copy_datagram_msg(skb, off, msg, chunk);
+			if (err)
+				break;
+
+			copied += chunk;
+			if (copied >= len)
+				break;
+		}
+		goto done;
+	}
+
+	while (copied < len) {
+		u32 off;
+		size_t chunk;
+
+		skb = skb_peek(&sk->sk_receive_queue);
+		if (!skb)
+			break;
+
+		off = ARGO_SKB_CB(skb)->offset;
+		chunk = min_t(size_t, skb->len - off, len - copied);
+
+		err = skb_copy_datagram_msg(skb, off, msg, chunk);
+		if (err)
+			break;
+
+		copied += chunk;
+		t->rx_bytes -= chunk;
+
+		if (off + chunk < skb->len) {
+			ARGO_SKB_CB(skb)->offset = off + chunk;
+		} else {
+			skb_unlink(skb, &sk->sk_receive_queue);
+			kfree_skb(skb);
+		}
+	}
+
+	/*
+	 * Ring consumption stops while this socket is full, and nothing else
+	 * restarts it: the sender is blocked, so no further interrupt is
+	 * coming. Only relevant once the worker has actually parked an skb -
+	 * kicking it after every recv() costs a worker wakeup per message for
+	 * nothing.
+	 */
+	if (copied && t->h && !skb_queue_empty(&t->h->pending_skbs))
+		argo_ring_schedule_recv(t->h, 0);
+
+done:
+	if (copied)
+		return copied;
+
+	return err ? err : -EAGAIN;
+}
+
+static ssize_t argo_transport_stream_enqueue(struct vsock_sock *vsk,
+					     struct msghdr *msg, size_t len)
+{
+	struct sock *sk = &vsk->sk;
+	size_t total_len = len + sizeof(struct xen_argo_ring_message_header);
+	xen_argo_send_addr_t sendaddr;
+	struct sk_buff *skb;
+	long timeo;
+	int rc = 0;
+
+	if (sockaddrvm_to_argo(&vsk->local_addr, &sendaddr.src) ||
+	    sockaddrvm_to_argo(&vsk->remote_addr, &sendaddr.dst))
+		return -EINVAL;
+
+	skb = alloc_skb(total_len, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+
+	skb_reserve(skb, sizeof(struct xen_argo_ring_message_header));
+	if (memcpy_from_msg(skb_put(skb, len), msg, len)) {
+		kfree_skb(skb);
+		return -EFAULT;
+	}
+	timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+
+	for (;;) {
+		rc = argo_ring_send_skb(argo_trans(vsk)->h, skb, &sendaddr,
+					ARGO_MSG_DATA);
+		if (rc >= 0)
+			break;
+		if (rc != -EAGAIN && rc != -ENOBUFS)
+			break;
+		if (!timeo) {
+			rc = -EAGAIN;
+			break;
+		}
+
+		release_sock(sk);
+		usleep_range(50, 150);
+		lock_sock(sk);
+
+		/*
+		 * Deduct what was actually slept, not a flat millisecond: the
+		 * sleep above is ~100us, so a flat deduction retires a
+		 * SO_SNDTIMEO ten times too fast. MAX_SCHEDULE_TIMEOUT - a
+		 * blocking socket - has to stay pinned, or the loop invents a
+		 * deadline the caller never set.
+		 */
+		if (timeo != MAX_SCHEDULE_TIMEOUT) {
+			timeo -= usecs_to_jiffies(100);
+			if (timeo < 0)
+				timeo = 0;
+		}
+
+		if (sk->sk_err) {
+			rc = -sk->sk_err;
+			break;
+		}
+		if (sk->sk_shutdown & SEND_SHUTDOWN) {
+			rc = -EPIPE;
+			break;
+		}
+	}
+
+	kfree_skb(skb);
+
+	if (rc < 0)
+		return rc;
+
+	return len;
+}
+
+static s64 argo_transport_stream_has_data(struct vsock_sock *vsk)
+{
+	return argo_trans(vsk)->rx_bytes;
+}
+
+static s64 argo_transport_stream_has_space(struct vsock_sock *vsk)
+{
+	/*
+	 * How much the peer can take is not knowable without a credit exchange
+	 * (XEN_ARGO_OP_notify would cost a hypercall per poll). Reporting our
+	 * own ring's free space would be wrong: that is the receive direction,
+	 * and returning 0 here parks sendmsg() on a wait queue that nothing
+	 * wakes.
+	 *
+	 * Report the ring size and let stream_enqueue() do the real blocking
+	 * against Xen's -EAGAIN.
+	 */
+	return ring_len - ARGO_RING_ALIGN(1) -
+	       sizeof(struct xen_argo_ring_message_header);
+}
+
+static u64 argo_transport_stream_rcvhiwat(struct vsock_sock *vsk)
+{
+	return vsk->buffer_size;
+}
+
+static bool argo_transport_stream_is_active(struct vsock_sock *vsk)
+{
+	return true;
+}
+
+static bool argo_transport_stream_allow(struct vsock_sock *vsk, u32 cid,
+					u32 port)
+{
+	return true;
+}
+
 static u32 argo_transport_get_local_cid(void)
 {
 	/* TODO: May require svm_cid format instead of Argo. */
@@ -670,6 +852,14 @@ static struct vsock_transport argo_transport = {
 	.dgram_dequeue = argo_transport_dgram_dequeue,
 	.dgram_enqueue = argo_transport_dgram_enqueue,
 	.dgram_allow = argo_transport_dgram_allow,
+
+	.stream_dequeue = argo_transport_stream_dequeue,
+	.stream_enqueue = argo_transport_stream_enqueue,
+	.stream_has_data = argo_transport_stream_has_data,
+	.stream_has_space = argo_transport_stream_has_space,
+	.stream_rcvhiwat = argo_transport_stream_rcvhiwat,
+	.stream_is_active = argo_transport_stream_is_active,
+	.stream_allow = argo_transport_stream_allow,
 
 	.get_local_cid = argo_transport_get_local_cid,
 };
