@@ -209,6 +209,17 @@ DECLARE_STATIC_CALL(xen_hypercall, xen_hypercall_func);
 	(type)__res;							\
 })
 
+#define _hypercall5(type, name, a1, a2, a3, a4, a5)			\
+({									\
+	__HYPERCALL_DECLS;						\
+	__HYPERCALL_5ARG(a1, a2, a3, a4, a5);				\
+	asm volatile (__HYPERCALL					\
+		      : __HYPERCALL_5PARAM				\
+		      : __HYPERCALL_ENTRY(__HYPERVISOR_ ## name)	\
+		      : __HYPERCALL_CLOBBER5);				\
+	(type)__res;							\
+})
+
 static inline long
 xen_single_call(unsigned int call,
 		unsigned long a1, unsigned long a2,
@@ -505,6 +516,19 @@ HYPERVISOR_dm_op(
 	__xen_stac();
 	ret = _hypercall3(int, dm_op, dom, nr_bufs, bufs);
 	__xen_clac();
+	return ret;
+}
+
+static inline int __must_check
+HYPERVISOR_argo_op(int cmd, void *arg1, void *arg2, uint32_t arg3,
+		   uint32_t arg4)
+{
+	int ret;
+
+	__xen_stac();
+	ret = _hypercall5(int, argo_op, cmd, arg1, arg2, arg3, arg4);
+	__xen_clac();
+
 	return ret;
 }
 
