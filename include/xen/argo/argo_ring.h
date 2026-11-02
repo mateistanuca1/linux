@@ -87,6 +87,8 @@ bool argo_ring_exists(domid_t domain, unsigned int port);
 /*
  * Ring "send" primitive. send is synchronous, direct hypercall to Xen.
  */
+int argo_ring_send(struct argo_ring_hnd *h, xen_argo_iov_t *iov,
+		   xen_argo_send_addr_t *send, uint32_t msg_type);
 int argo_ring_recv(struct argo_ring_hnd *h, void *buf, size_t len);
 
 #endif /* !_ARGO_RING_H_ */

@@ -355,5 +355,22 @@ int argo_ring_recv(struct argo_ring_hnd *h, void *buf, size_t len)
 }
 EXPORT_SYMBOL_GPL(argo_ring_recv);
 
+int argo_ring_send(struct argo_ring_hnd *h, xen_argo_iov_t *iov,
+		   xen_argo_send_addr_t *send, uint32_t msg_type)
+{
+	int rc;
+
+	rc = HYPERVISOR_argo_op(XEN_ARGO_OP_sendv, send, iov, 1, msg_type);
+
+	/* -EAGAIN is normal back-pressure, do not log it per message. */
+	if (rc < 0 && rc != -EAGAIN)
+		pr_warn_ratelimited("Failed to send packet (%uB) through Argo to dom%u:%u (%d).\n",
+				    iov[0].iov_len, send->dst.domain_id,
+				    send->dst.aport, -rc);
+
+	return rc;
+}
+EXPORT_SYMBOL_GPL(argo_ring_send);
+
 MODULE_DESCRIPTION("Xen Argo core ring primitives.");
 MODULE_LICENSE("GPL");
