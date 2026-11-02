@@ -31,56 +31,50 @@ typedef uint64_t xen_argo_gfn_t;
  * an array of xen_argo_iov_t structs on the hypervisor stack, so could cause
  * stack overflow if the value is too large.
  * The Linux Argo driver never passes more than two iovs.
-*/
+ */
 #define XEN_ARGO_MAXIOV          8U
 
-typedef struct xen_argo_iov
-{
-    XEN_GUEST_HANDLE(uint8) iov_hnd;
-    uint32_t iov_len;
-    uint32_t pad;
+typedef struct xen_argo_iov {
+	uint64_t iov_hnd;
+	uint32_t iov_len;
+	uint32_t pad;
 } xen_argo_iov_t;
 
-typedef struct xen_argo_addr
-{
-    xen_argo_port_t aport;
-    domid_t domain_id;
-    uint16_t pad;
+typedef struct xen_argo_addr {
+	xen_argo_port_t aport;
+	domid_t domain_id;
+	uint16_t pad;
 } xen_argo_addr_t;
 
-typedef struct xen_argo_send_addr
-{
-    xen_argo_addr_t src;
-    xen_argo_addr_t dst;
+typedef struct xen_argo_send_addr {
+	xen_argo_addr_t src;
+	xen_argo_addr_t dst;
 } xen_argo_send_addr_t;
 
-typedef struct xen_argo_ring
-{
-    /* Guests should use atomic operations to access rx_ptr */
-    uint32_t rx_ptr;
-    /* Guests should use atomic operations to access tx_ptr */
-    uint32_t tx_ptr;
-    /*
-     * Header space reserved for later use. Align the start of the ring to a
-     * multiple of the message slot size.
-     */
-    uint8_t reserved[56];
-    uint8_t ring[XEN_FLEX_ARRAY_DIM];
+typedef struct xen_argo_ring {
+	/* Guests should use atomic operations to access rx_ptr */
+	uint32_t rx_ptr;
+	/* Guests should use atomic operations to access tx_ptr */
+	uint32_t tx_ptr;
+	/*
+	 * Header space reserved for later use. Align the start of the ring to a
+	 * multiple of the message slot size.
+	 */
+	uint8_t reserved[56];
+	uint8_t ring[];
 } xen_argo_ring_t;
 
-typedef struct xen_argo_register_ring
-{
-    xen_argo_port_t aport;
-    domid_t partner_id;
-    uint16_t pad;
-    uint32_t len;
+typedef struct xen_argo_register_ring {
+	xen_argo_port_t aport;
+	domid_t partner_id;
+	uint16_t pad;
+	uint32_t len;
 } xen_argo_register_ring_t;
 
-typedef struct xen_argo_unregister_ring
-{
-    xen_argo_port_t aport;
-    domid_t partner_id;
-    uint16_t pad;
+typedef struct xen_argo_unregister_ring {
+	xen_argo_port_t aport;
+	domid_t partner_id;
+	uint16_t pad;
 } xen_argo_unregister_ring_t;
 
 /* Messages on the ring are padded to a multiple of this size. */
@@ -102,28 +96,25 @@ typedef struct xen_argo_unregister_ring
 /* Too many domains waiting for available space signals for this ring */
 #define XEN_ARGO_RING_EBUSY             (1U << 5)
 
-typedef struct xen_argo_ring_data_ent
-{
-    xen_argo_addr_t ring;
-    uint16_t flags;
-    uint16_t pad;
-    uint32_t space_required;
-    uint32_t max_message_size;
+typedef struct xen_argo_ring_data_ent {
+	xen_argo_addr_t ring;
+	uint16_t flags;
+	uint16_t pad;
+	uint32_t space_required;
+	uint32_t max_message_size;
 } xen_argo_ring_data_ent_t;
 
-typedef struct xen_argo_ring_data
-{
-    uint32_t nent;
-    uint32_t pad;
-    xen_argo_ring_data_ent_t data[XEN_FLEX_ARRAY_DIM];
+typedef struct xen_argo_ring_data {
+	uint32_t nent;
+	uint32_t pad;
+	xen_argo_ring_data_ent_t data[];
 } xen_argo_ring_data_t;
 
-struct xen_argo_ring_message_header
-{
-    uint32_t len;
-    xen_argo_addr_t source;
-    uint32_t message_type;
-    uint8_t data[XEN_FLEX_ARRAY_DIM];
+struct xen_argo_ring_message_header {
+	uint32_t len;
+	xen_argo_addr_t source;
+	uint32_t message_type;
+	uint8_t data[];
 };
 
 /*
