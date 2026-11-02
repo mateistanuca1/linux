@@ -22,7 +22,7 @@ EXPORT_SYMBOL_GPL(vsock_addr_init);
 
 int vsock_addr_validate(const struct sockaddr_vm *addr)
 {
-	__u8 svm_valid_flags = VMADDR_FLAG_TO_HOST;
+	__u8 svm_valid_flags = VMADDR_FLAG_TO_HOST | VMADDR_FLAG_NO_LOCAL;
 
 	if (!addr)
 		return -EFAULT;

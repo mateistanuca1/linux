@@ -150,6 +150,8 @@
  */
 #define VMADDR_FLAG_TO_HOST 0x01
 
+#define VMADDR_FLAG_NO_LOCAL 0x02
+
 /* Invalid vSockets version. */
 
 #define VM_SOCKETS_INVALID_VERSION -1U
