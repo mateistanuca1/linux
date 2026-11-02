@@ -922,6 +922,25 @@ static int argo_transport_notify_send_post_enqueue(struct vsock_sock *vsk, ssize
 	return 0;
 }
 
+/*
+ * Shutdown.
+ */
+static int argo_transport_shutdown(struct vsock_sock *vsk, int mode)
+{
+	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
+	xen_argo_send_addr_t addr;
+
+	if (skb) {
+		sockaddrvm_to_argo(&vsk->remote_addr, &addr.dst);
+		sockaddrvm_to_argo(&vsk->local_addr, &addr.src);
+		argo_ring_send_skb(argo_trans(vsk)->h, skb, &addr,
+				   ARGO_MSG_FIN);
+		kfree_skb(skb);
+	}
+
+	return 0;
+}
+
 static u32 argo_transport_get_local_cid(void)
 {
 	/* The Argo CID is the Xen domain id. */
@@ -959,6 +978,8 @@ static struct vsock_transport argo_transport = {
 	.notify_send_pre_block = argo_transport_notify_send_pre_block,
 	.notify_send_pre_enqueue = argo_transport_notify_send_pre_enqueue,
 	.notify_send_post_enqueue = argo_transport_notify_send_post_enqueue,
+
+	.shutdown = argo_transport_shutdown,
 
 	.get_local_cid = argo_transport_get_local_cid,
 };
