@@ -372,4 +372,14 @@ config XEN_VIRTIO_FORCE_GRANT
 	  of the guest memory. This will need support on the backend side
 	  (e.g. qemu or kernel, depending on the virtio device types used).
 
+config XEN_ARGO
+	tristate
+	depends on XEN && X86
+	help
+	  Core Xen Argo ring primitives and hypercall wrappers.
+
+	  Argo is a hypervisor-mediated interdomain transport: the hypervisor
+	  copies each message between registered rings, so the two domains
+	  share no memory.
+
 endmenu
