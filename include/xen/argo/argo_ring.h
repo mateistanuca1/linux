@@ -83,6 +83,7 @@ size_t argo_ring_has_space(const struct argo_ring_hnd *h);
  */
 int argo_ring_register(struct argo_ring_hnd *h);
 bool argo_ring_exists(domid_t domain, unsigned int port);
+domid_t xen_get_domid(void);
 
 /*
  * Ring "send" primitive. send is synchronous, direct hypercall to Xen.
