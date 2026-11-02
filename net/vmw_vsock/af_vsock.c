@@ -1940,6 +1940,27 @@ static int vsock_listen(struct socket *sock, int backlog)
 	sk->sk_max_ack_backlog = backlog;
 	sk->sk_state = TCP_LISTEN;
 
+	/*
+	 * A transport that has to allocate resources before it can receive
+	 * connection requests needs one assigned by now; a socket that was
+	 * only bound does not have one yet.
+	 */
+	if (!vsk->transport) {
+		err = vsock_assign_transport(vsk, NULL);
+		if (err) {
+			sk->sk_state = TCP_CLOSE;
+			goto out;
+		}
+	}
+
+	if (vsk->transport->listen) {
+		err = vsk->transport->listen(vsk);
+		if (err) {
+			sk->sk_state = TCP_CLOSE;
+			goto out;
+		}
+	}
+
 	err = 0;
 
 out:

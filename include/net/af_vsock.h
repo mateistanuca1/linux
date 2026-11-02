@@ -118,6 +118,7 @@ struct vsock_transport {
 
 	/* Connections. */
 	int (*connect)(struct vsock_sock *);
+	int (*listen)(struct vsock_sock *vsk);
 
 	/* DGRAM. */
 	int (*dgram_bind)(struct vsock_sock *, struct sockaddr_vm *);
