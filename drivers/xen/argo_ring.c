@@ -332,5 +332,41 @@ int argo_ring_send(struct argo_ring_hnd *h, xen_argo_iov_t *iov,
 }
 EXPORT_SYMBOL_GPL(argo_ring_send);
 
+domid_t xen_get_domid(void)
+{
+	domid_t domid = DOMID_INVALID;
+	struct evtchn_alloc_unbound op;
+	struct evtchn_status status;
+	struct evtchn_close close_op;
+	int rc;
+
+	/* Allocate an unbound event channel. */
+	op.dom = DOMID_SELF;
+	op.remote_dom = DOMID_SELF;
+	rc = HYPERVISOR_event_channel_op(EVTCHNOP_alloc_unbound, &op);
+	if (rc) {
+		pr_err("alloc_unbound failed with rc=%d\n", rc);
+		return domid;
+	}
+
+	/* Query the status of the port to find the real domid. */
+	status.dom = DOMID_SELF;
+	status.port = op.port;
+	rc = HYPERVISOR_event_channel_op(EVTCHNOP_status, &status);
+	if (rc)
+		pr_err("EVTCHNOP_status failed with rc=%d\n", rc);
+	else
+		domid = status.u.unbound.dom;
+
+	/* Clean up the port. */
+	close_op.port = op.port;
+	rc = HYPERVISOR_event_channel_op(EVTCHNOP_close, &close_op);
+	if (rc)
+		pr_warn("close_port %d failed rc=%d\n", op.port, rc);
+
+	return domid;
+}
+EXPORT_SYMBOL_GPL(xen_get_domid);
+
 MODULE_DESCRIPTION("Xen Argo core ring primitives.");
 MODULE_LICENSE("GPL");
