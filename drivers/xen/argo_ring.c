@@ -29,6 +29,16 @@ static struct list_head argo_rings;
 static DEFINE_RWLOCK(argo_rings_lock);
 
 /*
+ * Workqueue draining the rings into sk_buffs, in process context.
+ */
+static struct workqueue_struct *argo_recv_wq;
+
+/* Retry delay when the receive path is out of memory. */
+#define ARGO_RECV_RETRY_DELAY	msecs_to_jiffies(1)
+
+static void argo_recv_work_fn(struct work_struct *work);
+
+/*
  * Ring management helpers.
  */
 static void argo_ring_free(xen_argo_ring_t *r)
@@ -115,6 +125,8 @@ struct argo_ring_hnd *argo_ring_handle_alloc(domid_t domain, unsigned int port,
 
 	kref_init(&h->refcount);
 	spin_lock_init(&h->ring_lock);
+	skb_queue_head_init(&h->pending_skbs);
+	INIT_DELAYED_WORK(&h->recv_work, argo_recv_work_fn);
 
 	h->partner_id = domain;
 	h->aport = port;
@@ -221,10 +233,12 @@ static void argo_ring_handle_release(struct kref *kref)
 	write_unlock_irq(&argo_rings_lock);
 
 	/*
-	 * Off the list, so nothing can reach the ring any more; only then
-	 * tell Xen to stop delivering into it.
+	 * Off the list and the worker stopped, so nothing can reach the ring
+	 * any more; only then tell Xen to stop delivering into it.
 	 */
+	cancel_delayed_work_sync(&h->recv_work);
 	argo_ring_unregister(h);
+	skb_queue_purge(&h->pending_skbs);
 
 	if (h->priv_put)
 		h->priv_put(h->priv);
@@ -307,6 +321,95 @@ static void argo_ring_consume(struct argo_ring_hnd *h, size_t len)
 	WRITE_ONCE(r->rx_ptr, rx);
 }
 
+/*
+ * Pull one message off the ring into an sk_buff.
+ *
+ * The message is only consumed once it is fully copied into an skb. On
+ * failure rx_ptr stays put and the message is retried later: this carries
+ * SOCK_STREAM traffic, so silently dropping a message would punch a hole in
+ * the byte stream and wedge the peer forever.
+ *
+ * The skb is paged. A 64KB message would otherwise need an order-5 contiguous
+ * allocation, which fails routinely once the machine is under load.
+ */
+static struct sk_buff *argo_ring_recv_skb(struct argo_ring_hnd *h)
+{
+	struct xen_argo_ring_message_header mh;
+	struct sk_buff *skb;
+	size_t msg_len, avail, off;
+	int i, err = 0;
+
+	spin_lock(&h->ring_lock);
+
+	avail = argo_ring_has_data(h);
+	if (avail < sizeof(mh)) {
+		err = -ENODATA;
+		goto out;
+	}
+
+	argo_ring_copy_out(h, &mh, 0, sizeof(mh));
+
+	if (unlikely(mh.len < sizeof(mh) ||
+		     ARGO_RING_ALIGN(mh.len) > avail)) {
+		pr_err("Invalid packet, message size %u out of range (%zuB available).\n",
+		       mh.len, avail);
+		/* The ring is inconsistent, it cannot be resynchronised. */
+		err = -EPROTO;
+		goto out;
+	}
+	msg_len = mh.len - sizeof(mh);
+
+	skb = alloc_skb_with_frags(sizeof(mh), msg_len, PAGE_ALLOC_COSTLY_ORDER,
+				   &err, GFP_KERNEL | __GFP_NOWARN);
+	if (!skb) {
+		if (!err)
+			err = -ENOMEM;
+		goto out;
+	}
+
+	memcpy(skb_put(skb, sizeof(mh)), &mh, sizeof(mh));
+	skb->len += msg_len;
+	skb->data_len = msg_len;
+
+	off = sizeof(mh);
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+		const size_t flen = skb_frag_size(frag);
+
+		argo_ring_copy_out(h, skb_frag_address(frag), off, flen);
+		off += flen;
+	}
+
+	argo_ring_consume(h, ARGO_RING_ALIGN(mh.len));
+	spin_unlock(&h->ring_lock);
+
+	return skb;
+
+out:
+	spin_unlock(&h->ring_lock);
+	return ERR_PTR(err);
+}
+
+void argo_ring_schedule_recv(struct argo_ring_hnd *h, unsigned long delay)
+{
+	if (!argo_recv_wq)
+		return;
+
+	/*
+	 * An immediate kick has to be mod_delayed_work(): queue_delayed_work()
+	 * is a no-op while the work is already armed, so an interrupt landing
+	 * during the retry delay is swallowed and the ring sits untouched for
+	 * the remainder of it - a lost wakeup that costs a full retry period.
+	 * mod_delayed_work() with a zero delay runs the worker whatever state
+	 * it was in, and is documented as safe from an interrupt handler.
+	 */
+	if (delay)
+		queue_delayed_work(argo_recv_wq, &h->recv_work, delay);
+	else
+		mod_delayed_work(argo_recv_wq, &h->recv_work, 0);
+}
+EXPORT_SYMBOL_GPL(argo_ring_schedule_recv);
+
 int argo_ring_send(struct argo_ring_hnd *h, xen_argo_iov_t *iov,
 		   xen_argo_send_addr_t *send, uint32_t msg_type)
 {
@@ -367,6 +470,116 @@ domid_t xen_get_domid(void)
 	return domid;
 }
 EXPORT_SYMBOL_GPL(xen_get_domid);
+
+/*
+ * Worker draining one ring into sk_buffs and handing them to the transport.
+ */
+static void argo_recv_work_fn(struct work_struct *work)
+{
+	struct argo_ring_hnd *h = container_of(to_delayed_work(work),
+					       struct argo_ring_hnd,
+					       recv_work);
+	struct sk_buff *skb;
+	int rc;
+
+	for (;;) {
+		/* An skb the destination socket could not take last time. */
+		skb = skb_dequeue(&h->pending_skbs);
+		if (!skb) {
+			skb = argo_ring_recv_skb(h);
+			if (IS_ERR(skb)) {
+				rc = PTR_ERR(skb);
+				if (rc == -ENOMEM || rc == -ENOBUFS)
+					/* Message still in the ring: retry. */
+					argo_ring_schedule_recv(h,
+								ARGO_RECV_RETRY_DELAY);
+				else if (rc != -ENODATA)
+					pr_err("Ring dom%u:%u unusable (%d), stopping receive.\n",
+					       h->partner_id, h->aport, -rc);
+				break;
+			}
+		}
+
+		rc = h->recv_cb(h->priv, skb);
+		if (rc == -ENOBUFS) {
+			/*
+			 * Destination socket receive queue is full. Stop
+			 * draining the ring so that the sender blocks in
+			 * sendv() instead of us buffering without bound; the
+			 * reader kicks us again once it has made room.
+			 */
+			skb_queue_head(&h->pending_skbs, skb);
+			break;
+		}
+		if (rc) {
+			pr_warn_ratelimited("Failed to queue received packet, dropping.\n");
+			kfree_skb(skb);
+		}
+	}
+}
+
+/*
+ * One VIRQ_ARGO covers every ring: the event channel is a pending bit, not a
+ * counter, so notifications coalesce and the handler has to look at all of
+ * them. Hard interrupt context - it only kicks the workers.
+ */
+static irqreturn_t argo_interrupt(int irq, void *dev_id)
+{
+	struct argo_ring_hnd *h, *tmp;
+
+	read_lock(&argo_rings_lock);
+	list_for_each_entry_safe(h, tmp, &argo_rings, l) {
+		if (argo_ring_has_data(h) >=
+		    sizeof(struct xen_argo_ring_message_header)) {
+			argo_ring_schedule_recv(h, 0);
+		}
+	}
+	read_unlock(&argo_rings_lock);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * Initialisation and cleanup of the VIRQ.
+ */
+static int argo_irq = -1;
+
+int argo_core_init(void)
+{
+	int rc;
+
+	argo_ring_check_sizes();
+	INIT_LIST_HEAD(&argo_rings);
+
+	/*
+	 * Per-CPU rather than WQ_UNBOUND: the worker then runs on the CPU that
+	 * took the interrupt, with the ring still cache-hot, and the wakeup
+	 * skips the unbound pool's CPU selection.
+	 */
+	argo_recv_wq = alloc_workqueue("argo_recv", WQ_HIGHPRI | WQ_PERCPU, 0);
+	if (!argo_recv_wq)
+		return -ENOMEM;
+
+	rc = bind_virq_to_irqhandler(VIRQ_ARGO, 0, argo_interrupt, 0,
+				     "argo", NULL);
+	if (rc < 0) {
+		destroy_workqueue(argo_recv_wq);
+		argo_recv_wq = NULL;
+		return rc;
+	}
+
+	argo_irq = rc;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(argo_core_init);
+
+void argo_core_cleanup(void)
+{
+	unbind_from_irqhandler(argo_irq, NULL);
+	destroy_workqueue(argo_recv_wq);
+}
+EXPORT_SYMBOL_GPL(argo_core_cleanup);
 
 MODULE_DESCRIPTION("Xen Argo core ring primitives.");
 MODULE_LICENSE("GPL");
