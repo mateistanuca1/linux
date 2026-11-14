@@ -52,6 +52,8 @@ struct argo_transport {
 	 * and walking a deep queue there is quadratic.
 	 */
 	u32 rx_bytes;
+	/* The peer has been told this end is finished. */
+	bool fin_sent;
 };
 
 /*
@@ -95,9 +97,19 @@ static void argo_transport_destruct(struct vsock_sock *vsk)
 	vsk->trans = NULL;
 }
 
+static void argo_send_fin(struct vsock_sock *vsk);
+
 static void argo_transport_release(struct vsock_sock *vsk)
 {
 	struct argo_transport *t = argo_trans(vsk);
+
+	/*
+	 * af_vsock calls .release when the socket is closed and never calls
+	 * .shutdown there, so a close() that was not preceded by shutdown()
+	 * has to tell the peer from here. Before the handle is dropped: the
+	 * send needs the ring.
+	 */
+	argo_send_fin(vsk);
 
 	vsock_remove_sock(vsk);
 
@@ -977,6 +989,46 @@ static int argo_transport_notify_send_post_enqueue(struct vsock_sock *vsk, ssize
 	return 0;
 }
 
+/*
+ * Shutdown.
+ */
+/*
+ * Tell the peer this end is finished, once. Only a connected stream socket
+ * has anywhere to send it: a datagram socket has no peer state to end, and a
+ * listener's remote address is unset.
+ */
+static void argo_send_fin(struct vsock_sock *vsk)
+{
+	struct argo_transport *t = argo_trans(vsk);
+	xen_argo_send_addr_t addr;
+	struct sk_buff *skb;
+
+	if (t->fin_sent || !t->h)
+		return;
+	if (vsk->sk.sk_type != SOCK_STREAM)
+		return;
+	if (!vsock_addr_bound(&vsk->remote_addr))
+		return;
+
+	skb = alloc_skb(0, GFP_KERNEL);
+	if (!skb)
+		return;
+
+	sockaddrvm_to_argo(&vsk->remote_addr, &addr.dst);
+	sockaddrvm_to_argo(&vsk->local_addr, &addr.src);
+	argo_ring_send_skb(t->h, skb, &addr, ARGO_MSG_FIN);
+	kfree_skb(skb);
+
+	t->fin_sent = true;
+}
+
+static int argo_transport_shutdown(struct vsock_sock *vsk, int mode)
+{
+	argo_send_fin(vsk);
+
+	return 0;
+}
+
 static u32 argo_transport_get_local_cid(void)
 {
 	/* The Argo CID is the Xen domain id. */
@@ -1016,6 +1068,8 @@ static struct vsock_transport argo_transport = {
 	.notify_send_pre_block = argo_transport_notify_send_pre_block,
 	.notify_send_pre_enqueue = argo_transport_notify_send_pre_enqueue,
 	.notify_send_post_enqueue = argo_transport_notify_send_post_enqueue,
+
+	.shutdown = argo_transport_shutdown,
 
 	.get_local_cid = argo_transport_get_local_cid,
 };
