@@ -6,6 +6,7 @@ obj-$(CONFIG_VIRTIO_VSOCKETS) += vmw_vsock_virtio_transport.o
 obj-$(CONFIG_VIRTIO_VSOCKETS_COMMON) += vmw_vsock_virtio_transport_common.o
 obj-$(CONFIG_HYPERV_VSOCKETS) += hv_sock.o
 obj-$(CONFIG_VSOCKETS_LOOPBACK) += vsock_loopback.o
+obj-$(CONFIG_XEN_ARGO_VSOCKETS) += vmw_vsock_argo_transport.o
 
 vsock-y += af_vsock.o af_vsock_tap.o vsock_addr.o
 vsock-$(CONFIG_BPF_SYSCALL) += vsock_bpf.o
@@ -20,3 +21,5 @@ vmw_vsock_virtio_transport-y += virtio_transport.o
 vmw_vsock_virtio_transport_common-y += virtio_transport_common.o
 
 hv_sock-y += hyperv_transport.o
+
+vmw_vsock_argo_transport-y += argo_transport.o
