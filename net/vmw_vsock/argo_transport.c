@@ -911,6 +911,72 @@ static bool argo_transport_stream_allow(struct vsock_sock *vsk, u32 cid,
 	return true;
 }
 
+/*
+ * Notification.
+ */
+static int argo_transport_notify_poll_in(struct vsock_sock *vsk, size_t target,
+					 bool *data_ready_now)
+{
+	*data_ready_now = vsock_stream_has_data(vsk);
+	return 0;
+}
+
+static int argo_transport_notify_poll_out(struct vsock_sock *vsk, size_t target,
+					  bool *space_available_now)
+{
+	*space_available_now = vsock_stream_has_space(vsk);
+	return 0;
+}
+
+static int argo_transport_notify_recv_init(struct vsock_sock *vsk, size_t target,
+					   struct vsock_transport_recv_notify_data *data)
+{
+	return 0;
+}
+
+static int argo_transport_notify_recv_pre_block(struct vsock_sock *vsk, size_t target,
+						struct vsock_transport_recv_notify_data *data)
+{
+	return 0;
+}
+
+static int argo_transport_notify_recv_pre_dequeue(struct vsock_sock *vsk, size_t target,
+						  struct vsock_transport_recv_notify_data *data)
+{
+	return 0;
+}
+
+static int argo_transport_notify_recv_post_dequeue(struct vsock_sock *vsk, size_t target,
+						   ssize_t copied, bool data_read,
+						   struct vsock_transport_recv_notify_data *data)
+{
+	return 0;
+}
+
+static int argo_transport_notify_send_init(struct vsock_sock *vsk,
+					   struct vsock_transport_send_notify_data *data)
+{
+	return 0;
+}
+
+static int argo_transport_notify_send_pre_block(struct vsock_sock *vsk,
+						struct vsock_transport_send_notify_data *data)
+{
+	return 0;
+}
+
+static int argo_transport_notify_send_pre_enqueue(struct vsock_sock *vsk,
+						  struct vsock_transport_send_notify_data *data)
+{
+	return 0;
+}
+
+static int argo_transport_notify_send_post_enqueue(struct vsock_sock *vsk, ssize_t written,
+						   struct vsock_transport_send_notify_data *data)
+{
+	return 0;
+}
+
 static u32 argo_transport_get_local_cid(void)
 {
 	/* The Argo CID is the Xen domain id. */
@@ -940,6 +1006,17 @@ static struct vsock_transport argo_transport = {
 	.stream_is_active = argo_transport_stream_is_active,
 	.stream_allow = argo_transport_stream_allow,
 
+	.notify_poll_in = argo_transport_notify_poll_in,
+	.notify_poll_out = argo_transport_notify_poll_out,
+	.notify_recv_init = argo_transport_notify_recv_init,
+	.notify_recv_pre_block = argo_transport_notify_recv_pre_block,
+	.notify_recv_pre_dequeue = argo_transport_notify_recv_pre_dequeue,
+	.notify_recv_post_dequeue = argo_transport_notify_recv_post_dequeue,
+	.notify_send_init = argo_transport_notify_send_init,
+	.notify_send_pre_block = argo_transport_notify_send_pre_block,
+	.notify_send_pre_enqueue = argo_transport_notify_send_pre_enqueue,
+	.notify_send_post_enqueue = argo_transport_notify_send_post_enqueue,
+
 	.get_local_cid = argo_transport_get_local_cid,
 };
 
@@ -950,6 +1027,13 @@ static int __init argo_transport_init(void)
 	rc = vsock_core_register(&argo_transport, VSOCK_TRANSPORT_F_DGRAM);
 	if (rc) {
 		pr_err("vsock_core_register(DGRAM) failed (%d).\n", rc);
+		return rc;
+	}
+
+	rc = vsock_core_register(&argo_transport, VSOCK_TRANSPORT_F_G2H);
+	if (rc) {
+		pr_err("vsock_core_register(G2H) failed (%d).\n", rc);
+		vsock_core_unregister(&argo_transport);
 		return rc;
 	}
 
